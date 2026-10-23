@@ -1,0 +1,38 @@
+# Copyright (c) 2023 - 2026 Chair for Design Automation, TUM
+# Copyright (c) 2025 - 2026 Munich Quantum Software Company GmbH
+# All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License
+
+file(GLOB_RECURSE PASSES_SOURCES *.cpp)
+
+add_mlir_library(
+  MLIRQOracleTransforms
+  ${PASSES_SOURCES}
+  LINK_LIBS
+  PRIVATE
+  MLIRQOracleDialect
+  DEPENDS
+  MLIRQOracleTransformsIncGen)
+
+file(GLOB_RECURSE PASSES_HEADERS_SOURCE
+     ${MQT_MLIR_SOURCE_INCLUDE_DIR}/mqt/Dialect/QOracle/Transforms/*.h)
+file(GLOB_RECURSE PASSES_HEADERS_BUILD
+     ${MQT_MLIR_BUILD_INCLUDE_DIR}/mqt/Dialect/QOracle/Transforms/*.inc)
+
+target_sources(
+  MLIRQOracleTransforms
+  PUBLIC FILE_SET
+         HEADERS
+         BASE_DIRS
+         ${MQT_MLIR_SOURCE_INCLUDE_DIR}
+         FILES
+         ${PASSES_HEADERS_SOURCE}
+         FILE_SET
+         HEADERS
+         BASE_DIRS
+         ${MQT_MLIR_BUILD_INCLUDE_DIR}
+         FILES
+         ${PASSES_HEADERS_BUILD})
