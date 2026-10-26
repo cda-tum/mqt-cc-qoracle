@@ -97,6 +97,7 @@ def OracleOp : QOracleOp<"oracle", traits = [AttrSizedOperandSegments]> {
     /// Entry-block arguments of the body, split by operand group.
     ::mlir::Block::BlockArgListType getKeptAliases();
     ::mlir::Block::BlockArgListType getConsumedAliases();
+    bool ownsValue(::mlir::Value value);
   }];
 }
 

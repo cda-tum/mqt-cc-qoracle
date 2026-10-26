@@ -45,21 +45,6 @@ struct Sum {
   llvm::SmallVector<Value> terms;
 };
 
-bool isOwned(Value value, OracleOp oracle) {
-  if (llvm::find(oracle.getConsumedAliases(), value) !=
-      oracle.getConsumedAliases().end()) {
-    return true;
-  }
-  if (llvm::find(oracle.getKeptAliases(), value) !=
-      oracle.getKeptAliases().end()) {
-    return false;
-  }
-  if (oracle.getRegion().isAncestor(value.getParentRegion())) {
-    return true;
-  }
-  return false;
-}
-
 bool dependsOn(Operation* op, Operation* root) {
   auto* block = root->getBlock();
   llvm::SmallVector<Operation*> toVisit{op};
@@ -159,7 +144,7 @@ struct ReassociateOraclePattern final : OpRewritePattern<arith::AddIOp> {
     llvm::SmallVector<Value> reorderedTerms;
     bool foundHost = false;
     for (auto term : sum.terms) {
-      if (!foundHost && isOwned(term, addOp->getParentOfType<OracleOp>()) &&
+      if (!foundHost && addOp->getParentOfType<OracleOp>().ownsValue(term) &&
           canBeLastReader(sum, term)) {
         reorderedTerms.insert(reorderedTerms.begin(), term);
         foundHost = true;

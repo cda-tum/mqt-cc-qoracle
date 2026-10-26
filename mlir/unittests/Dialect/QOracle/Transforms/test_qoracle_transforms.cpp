@@ -743,6 +743,39 @@ TEST_F(QOracleTransformsTest, ScheduleTreatsNestedReadsAsReadsOfTheParent) {
   EXPECT_TRUE(ifOp->isBeforeInBlock(addition)) << print(oracle);
 }
 
+TEST_F(QOracleTransformsTest, ScheduleKeepsNestedUsesAfterTheirDefinitions) {
+  // %p waits for %q, and the scf.if cannot overwrite anything, but its branch
+  // uses %p, so it must stay after %p.
+  auto moduleOp = transform(R"mlir(
+    func.func @main(%k: i3, %m: i3) {
+      %q = qc.alloc : !qc.qubit
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%q : !qc.qubit as %K)
+                     consumed(%c : memref<3x!qc.qubit> as %C) {
+        %p = arith.addi %C, %k : i3
+        %n = scf.if %K -> (i3) {
+          %v = arith.andi %p, %m : i3
+          scf.yield %v : i3
+        } else {
+          scf.yield %m : i3
+        }
+        %w = arith.andi %C, %m : i3
+        %r = arith.xori %n, %w : i3
+        qoracle.yield %r : i3
+      }
+      return
+    })mlir",
+                            SCHEDULE);
+  ASSERT_TRUE(moduleOp);
+  auto oracle = findOracle(*moduleOp);
+  scf::IfOp ifOp;
+  arith::AddIOp addition;
+  oracle.walk([&](scf::IfOp op) { ifOp = op; });
+  oracle.walk([&](arith::AddIOp op) { addition = op; });
+  ASSERT_TRUE(ifOp && addition);
+  EXPECT_TRUE(addition->isBeforeInBlock(ifOp)) << print(oracle);
+}
+
 TEST_F(QOracleTransformsTest, ScheduleKeepsOperationsInTheirBlocks) {
   const auto* source = R"mlir(
     func.func @main(%k: i3, %m: i3) {

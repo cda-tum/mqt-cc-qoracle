@@ -106,3 +106,16 @@ Block::BlockArgListType OracleOp::getKeptAliases() {
 Block::BlockArgListType OracleOp::getConsumedAliases() {
   return getRegion().getArguments().drop_front(getKeptQubits().size());
 }
+
+bool OracleOp::ownsValue(Value value) {
+  if (llvm::find(getConsumedAliases(), value) != getConsumedAliases().end()) {
+    return true;
+  }
+  if (llvm::find(getKeptAliases(), value) != getKeptAliases().end()) {
+    return false;
+  }
+  if (getRegion().isAncestor(value.getParentRegion())) {
+    return true;
+  }
+  return false;
+}
