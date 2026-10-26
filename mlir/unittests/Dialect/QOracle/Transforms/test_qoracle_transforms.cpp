@@ -262,6 +262,20 @@ static void collectSum(Value value, Sum& sum) {
   });
 }
 
+/// Check whether `sum` is a single chain: no addition of `sum` adds two
+/// other additions of `sum`, so each one adds a single new term.
+[[nodiscard]] static bool isSingleChain(const Sum& sum) {
+  SmallPtrSet<Operation*, 8> additions;
+  for (auto addition : sum.additions) {
+    additions.insert(addition);
+  }
+  return llvm::all_of(sum.additions, [&](arith::AddIOp addition) {
+    return llvm::count_if(addition->getOperands(), [&](Value v) {
+             return additions.contains(v.getDefiningOp());
+           }) <= 1;
+  });
+}
+
 [[nodiscard]] static Value yieldedValue(qoracle::OracleOp oracle) {
   return oracle.getRegion().front().getTerminator()->getOperand(0);
 }
@@ -532,6 +546,62 @@ TEST_F(QOracleTransformsTest, ReassociateLeavesNormalSumsUnchanged) {
       return
     })mlir",
                   REASSOCIATE);
+}
+
+TEST_F(QOracleTransformsTest, ReassociateFlattensPartialSumsIntoOneChain) {
+  // `%B + %x` adds two values that must not be overwritten, so it would need a
+  // fresh register; the single chain adds every term into `%C`.
+  auto moduleOp = transform(R"mlir(
+    func.func @main(%x: i3) {
+      %a = memref.alloc() : memref<3x!qc.qubit>
+      %b = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%a : memref<3x!qc.qubit> as %A,
+                          %b : memref<3x!qc.qubit> as %B)
+                     consumed(%c : memref<3x!qc.qubit> as %C) {
+        %l = arith.addi %C, %A : i3
+        %r = arith.addi %B, %x : i3
+        %s = arith.addi %l, %r : i3
+        qoracle.yield %s : i3
+      }
+      return
+    })mlir",
+                            REASSOCIATE);
+  ASSERT_TRUE(moduleOp);
+  auto oracle = findOracle(*moduleOp);
+  auto sum = collectSum(yieldedValue(oracle));
+  EXPECT_EQ(sum.additions.size(), 3U) << print(oracle);
+  EXPECT_TRUE(isSingleChain(sum)) << print(oracle);
+  EXPECT_TRUE(startsAt(sum, oracle.getConsumedAliases()[0])) << print(oracle);
+}
+
+TEST_F(QOracleTransformsTest, ReassociateFlattensPartialSumsWithoutHost) {
+  // No term may be overwritten, but one chain still needs one fresh register
+  // where the two partial sums need two.
+  auto moduleOp = transform(R"mlir(
+    func.func @main(%x: i3, %y: i3) {
+      %a = memref.alloc() : memref<3x!qc.qubit>
+      %b = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%a : memref<3x!qc.qubit> as %A,
+                          %b : memref<3x!qc.qubit> as %B)
+                     consumed(%c : memref<3x!qc.qubit> as %C) {
+        %l = arith.addi %A, %B : i3
+        %r = arith.addi %x, %y : i3
+        %s = arith.addi %l, %r : i3
+        %t = arith.xori %C, %s : i3
+        qoracle.yield %t : i3
+      }
+      return
+    })mlir",
+                            REASSOCIATE);
+  ASSERT_TRUE(moduleOp);
+  auto oracle = findOracle(*moduleOp);
+  auto xorOp = yieldedValue(oracle).getDefiningOp<arith::XOrIOp>();
+  ASSERT_TRUE(xorOp);
+  auto sum = collectSum(xorOp.getRhs());
+  EXPECT_EQ(sum.additions.size(), 3U) << print(oracle);
+  EXPECT_TRUE(isSingleChain(sum)) << print(oracle);
 }
 
 TEST_F(QOracleTransformsTest, ReassociateLeavesCodeOutsideOraclesUnchanged) {
