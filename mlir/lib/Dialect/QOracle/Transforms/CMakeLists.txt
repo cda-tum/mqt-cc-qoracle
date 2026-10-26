@@ -12,8 +12,13 @@ add_mlir_library(
   MLIRQOracleTransforms
   ${PASSES_SOURCES}
   LINK_LIBS
+  PUBLIC
+  MLIRPass
   PRIVATE
+  MLIRArithDialect
+  MLIRIR
   MLIRQOracleDialect
+  MLIRTransformUtils
   DEPENDS
   MLIRQOracleTransformsIncGen)
 
