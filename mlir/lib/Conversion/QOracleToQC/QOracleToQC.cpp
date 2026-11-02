@@ -304,6 +304,28 @@ void emitTemporary(Operation* op,
   storageMap[res] = std::move(helpers);
 }
 
+void updateXorI(ArrayRef<Value> overwrite, ArrayRef<Value> other, Location loc,
+                PatternRewriter& rewriter) {
+  auto bitWidth = overwrite.size();
+  for (size_t i = 0; i < bitWidth; i++) {
+    emitGate(loc, {other[i]}, overwrite[i], rewriter);
+  }
+}
+
+void updateAddI(ArrayRef<Value> overwrite, ArrayRef<Value> other, Location loc,
+                PatternRewriter& rewriter) {
+  auto bitWidth = overwrite.size();
+  for (size_t i = 0; i < bitWidth; i++) {
+    auto control = other[i];
+    for (size_t j = bitWidth - 1; j > i; j--) {
+      SmallVector<Value> args(overwrite.drop_front(i).take_front(j - i));
+      args.push_back(control);
+      emitGate(loc, args, overwrite[j], rewriter);
+    }
+    emitGate(loc, {other[i]}, overwrite[i], rewriter);
+  }
+}
+
 void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
                    PatternRewriter& rewriter) {
   rewriter.setInsertionPoint(op);
@@ -330,19 +352,19 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
   for (const auto& step : updateSteps) {
     SmallVector<RecordedGate> records;
     SmallVector<Value> allocated;
-    auto bitWidth = step.overwriteValue.getType().getIntOrFloatBitWidth();
 
     for (auto* tempOp : step.temporaries) {
       emitTemporary(tempOp, storageMap, records, allocated, rewriter);
     }
 
     if (isa<arith::XOrIOp>(step.updateOp)) {
-      for (size_t i = 0; i < bitWidth; i++) {
-        emitGate(loc, {storageMap.at(step.otherValue)[i]},
-                 storageMap.at(step.overwriteValue)[i], rewriter);
-      }
+      updateXorI(storageMap.at(step.overwriteValue),
+                 storageMap.at(step.otherValue), loc, rewriter);
+    } else if (isa<arith::AddIOp>(step.updateOp)) {
+      updateAddI(storageMap.at(step.overwriteValue),
+                 storageMap.at(step.otherValue), loc, rewriter);
     } else {
-      llvm_unreachable("addi updates are not lowered yet");
+      llvm_unreachable("other updates are not lowered");
     }
 
     for (const auto& rec : llvm::reverse(records)) {
