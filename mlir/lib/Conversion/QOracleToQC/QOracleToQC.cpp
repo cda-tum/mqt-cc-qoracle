@@ -36,6 +36,7 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -70,7 +71,6 @@ struct RecordedGate {
 
 SmallVector<Operation*>
 reachableTemporaries(Value source, DenseMap<Value, Value>& containers) {
-  // TODO-Damian make sure this handles captured block arguments correctly.
   SmallVector<Operation*> temporaries;
   SmallVector<std::pair<Value, bool>> toVisit{{source, false}};
   DenseSet<Operation*> collected;
@@ -138,6 +138,16 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
   DenseMap<Value, Value> containers;
   for (auto consumed : oracle.getConsumedAliases()) {
     containers[consumed] = consumed;
+  }
+
+  llvm::SetVector<Value> captured;
+  getUsedValuesDefinedAbove(oracle.getRegion(), captured);
+  for (auto value : captured) {
+    if (!matchPattern(value, m_Constant())) {
+      oracle.emitOpError("cannot lower qoracle because it captures a "
+                         "classical value that is not a constant");
+      return failure();
+    }
   }
 
   qoracle::YieldOp yield =

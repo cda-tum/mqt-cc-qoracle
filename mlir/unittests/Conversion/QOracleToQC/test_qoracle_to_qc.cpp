@@ -161,6 +161,8 @@ FailureOr<RegisterValues> BasisSimulator::run(func::FuncOp function,
       inputBits[&op] = allocated;
     } else if (auto constant = dyn_cast<arith::ConstantIndexOp>(op)) {
       indices_[constant.getResult()] = constant.value();
+    } else if (isa<arith::ConstantOp>(op)) {
+      // Constants captured by an oracle stay behind and hold no qubits.
     } else if (auto load = dyn_cast<memref::LoadOp>(op)) {
       const auto index = indices_.at(load.getIndices().front());
       const auto bit = registers_.at(load.getMemRef())[index];
@@ -217,11 +219,12 @@ protected:
         });
   }
 
-  /// Parse a function body wrapped in `@main`.
-  [[nodiscard]] OwningOpRef<ModuleOp> parseBody(StringRef body) {
+  /// Parse a function body wrapped in `@main`, which takes `arguments`.
+  [[nodiscard]] OwningOpRef<ModuleOp> parseBody(StringRef body,
+                                                StringRef arguments = "") {
     diagnostics.clear();
-    const std::string source =
-        "module {\nfunc.func @main() {\n" + body.str() + "\nreturn\n}\n}";
+    const std::string source = "module {\nfunc.func @main(" + arguments.str() +
+                               ") {\n" + body.str() + "\nreturn\n}\n}";
     return parseSourceString<ModuleOp>(source, context.get());
   }
 
@@ -294,8 +297,9 @@ protected:
 
   /// Expect that the pass rejects `body` with `message` and leaves the IR
   /// unchanged.
-  void expectRejected(StringRef body, StringRef message) {
-    auto moduleOp = parseBody(body);
+  void expectRejected(StringRef body, StringRef message,
+                      StringRef arguments = "") {
+    auto moduleOp = parseBody(body, arguments);
     ASSERT_TRUE(moduleOp) << diagnostics;
     const auto before = print(*moduleOp);
     EXPECT_FALSE(runPass(*moduleOp));
@@ -721,4 +725,38 @@ TEST_F(QOracleToQCTest, RejectsTemporaryReadingValueOverwrittenEarlier) {
       qoracle.yield %x1, %y1 : i1, i1
     })mlir",
                  "overwritten in a previous step");
+}
+
+TEST_F(QOracleToQCTest, LowersCapturedConstant) {
+  expectLowersTo(
+      R"mlir(
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    %three = arith.constant 3 : i2
+    qoracle.oracle consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %next = arith.addi %vr, %three : i2
+      qoracle.yield %next : i2
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[0] + 3U}; });
+}
+
+TEST_F(QOracleToQCTest, RejectsCapturedFunctionArgument) {
+  expectRejected(R"mlir(
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %next = arith.xori %vr, %x : i2
+      qoracle.yield %next : i2
+    })mlir",
+                 "captures a classical value that is not a constant", "%x: i2");
+}
+
+TEST_F(QOracleToQCTest, RejectsCapturedMeasurementResult) {
+  expectRejected(R"mlir(
+    %q = qc.alloc : !qc.qubit
+    %r = qc.alloc : !qc.qubit
+    %m = qc.measure %q : !qc.qubit -> i1
+    qoracle.oracle consumed(%r : !qc.qubit as %vr) {
+      %next = arith.xori %vr, %m : i1
+      qoracle.yield %next : i1
+    })mlir",
+                 "captures a classical value that is not a constant");
 }
