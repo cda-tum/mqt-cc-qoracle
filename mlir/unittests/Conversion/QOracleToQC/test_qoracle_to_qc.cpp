@@ -487,6 +487,179 @@ TEST_F(QOracleToQCTest, LowersEveryOracle) {
                  });
 }
 
+TEST_F(QOracleToQCTest, AddsKeptRegisterIntoConsumedRegister) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %next = arith.addi %vr, %va : i3
+      qoracle.yield %next : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] + in[0]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AddsIntoRightOperand) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %next = arith.addi %va, %vr : i3
+      qoracle.yield %next : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] + in[0]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AddsSingleBits) {
+  expectLowersTo(R"mlir(
+    %k = qc.alloc : !qc.qubit
+    %r = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%k : !qc.qubit as %vk)
+                   consumed(%r : !qc.qubit as %vr) {
+      %next = arith.addi %vr, %vk : i1
+      qoracle.yield %next : i1
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] + in[0]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AddsConstant) {
+  expectLowersTo(
+      R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %eleven = arith.constant 11 : i4
+      %next = arith.addi %vr, %eleven : i4
+      qoracle.yield %next : i4
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[0] + 11U}; });
+}
+
+TEST_F(QOracleToQCTest, IncrementsByControlQubit) {
+  expectLowersTo(R"mlir(
+    %k = qc.alloc : !qc.qubit
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%k : !qc.qubit as %vk)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %step = arith.extui %vk : i1 to i4
+      %next = arith.addi %vr, %step : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] + in[0]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AddsTemporaryIntoConsumedRegister) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i3
+      %next = arith.addi %vr, %ab : i3
+      qoracle.yield %next : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] + (in[0] & in[1])};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AddsConsumedRegisterThatIsNotOverwritten) {
+  expectLowersTo(R"mlir(
+    %x = memref.alloc() : memref<3x!qc.qubit>
+    %y = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle consumed(%x : memref<3x!qc.qubit> as %vx,
+                            %y : memref<3x!qc.qubit> as %vy) {
+      %next = arith.addi %vy, %vx : i3
+      qoracle.yield %vx, %next : i3, i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] + in[0]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, MixesAdditionsAndXors) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %r1 = arith.addi %vr, %va : i3
+      %r2 = arith.xori %r1, %vb : i3
+      %r3 = arith.addi %r2, %vb : i3
+      qoracle.yield %r3 : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], ((in[2] + in[0]) ^ in[1]) + in[1]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, ComputesSumIntoHelpers) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.addi %va, %vb : i3
+      %next = arith.xori %vr, %ab : i3
+      qoracle.yield %next : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] ^ (in[0] + in[1])};
+                 });
+}
+
+TEST_F(QOracleToQCTest, ComputesNestedSumsIntoHelpers) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %c = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb,
+                        %c : memref<2x!qc.qubit> as %vc)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %ab = arith.addi %va, %vb : i2
+      %abc = arith.addi %ab, %vc : i2
+      %next = arith.xori %vr, %abc : i2
+      qoracle.yield %next : i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {
+                       in[0],
+                       in[1],
+                       in[2],
+                       in[3] ^ (in[0] + in[1] + in[2]),
+                   };
+                 });
+}
+
+TEST_F(QOracleToQCTest, RejectsAdditionReadingTheOverwrittenValue) {
+  expectRejected(R"mlir(
+    %k = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%k : memref<2x!qc.qubit> as %vk)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %t = arith.andi %vr, %vk : i2
+      %next = arith.addi %vr, %t : i2
+      qoracle.yield %next : i2
+    })mlir",
+                 "a temporary depends on the value to be overwritten");
+}
+
 TEST_F(QOracleToQCTest, RejectsUnsupportedOperation) {
   expectRejected(R"mlir(
     %k = qc.alloc : !qc.qubit
