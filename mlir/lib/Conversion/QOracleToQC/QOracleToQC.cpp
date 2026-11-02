@@ -315,7 +315,7 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
   for (auto [alias, operand] : llvm::zip_equal(
            op.getRegion().front().getArguments(), op->getOperands())) {
     if (isa<QubitType>(operand.getType())) {
-      qora storageMap[alias] = {operand};
+      storageMap[alias] = {operand};
     } else {
       auto memrefType = cast<MemRefType>(operand.getType());
       auto size = memrefType.getDimSize(0);
