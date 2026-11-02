@@ -236,6 +236,54 @@ void emitGateAndRecord(Location loc, ArrayRef<Value> controls, Value target,
   records.emplace_back(llvm::to_vector(controls), target);
 }
 
+void applyXorIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
+                      Location loc, PatternRewriter& rewriter, bool record,
+                      SmallVector<RecordedGate>& records) {
+  auto bitWidth = overwrite.size();
+  for (size_t i = 0; i < bitWidth; i++) {
+    if (record) {
+      emitGateAndRecord(loc, {other[i]}, overwrite[i], records, rewriter);
+    } else {
+      emitGate(loc, {other[i]}, overwrite[i], rewriter);
+    }
+  }
+}
+
+void applyXorIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
+                      Location loc, PatternRewriter& rewriter) {
+  SmallVector<RecordedGate> records;
+  applyXorIInPlace(overwrite, other, loc, rewriter, false, records);
+}
+
+void applyAddIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
+                      Location loc, PatternRewriter& rewriter, bool record,
+                      SmallVector<RecordedGate>& records) {
+  auto bitWidth = overwrite.size();
+  for (size_t i = 0; i < bitWidth; i++) {
+    auto control = other[i];
+    for (size_t j = bitWidth - 1; j > i; j--) {
+      SmallVector<Value> args(overwrite.drop_front(i).take_front(j - i));
+      args.push_back(control);
+      if (record) {
+        emitGateAndRecord(loc, args, overwrite[j], records, rewriter);
+      } else {
+        emitGate(loc, args, overwrite[j], rewriter);
+      }
+    }
+    if (record) {
+      emitGateAndRecord(loc, {control}, overwrite[i], records, rewriter);
+    } else {
+      emitGate(loc, {control}, overwrite[i], rewriter);
+    }
+  }
+}
+
+void applyAddIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
+                      Location loc, PatternRewriter& rewriter) {
+  SmallVector<RecordedGate> records;
+  applyAddIInPlace(overwrite, other, loc, rewriter, false, records);
+}
+
 void emitTemporary(Operation* op,
                    DenseMap<Value, SmallVector<Value>>& storageMap,
                    SmallVector<RecordedGate>& records,
@@ -285,12 +333,8 @@ void emitTemporary(Operation* op,
   } else if (auto xoriOp = dyn_cast<arith::XOrIOp>(op)) {
     auto lhs = xoriOp.getOperand(0);
     auto rhs = xoriOp.getOperand(1);
-    for (size_t i = 0; i < bitWidth; ++i) {
-      emitGateAndRecord(loc, {storageMap.at(lhs)[i]}, helpers[i], records,
-                        rewriter);
-      emitGateAndRecord(loc, {storageMap.at(rhs)[i]}, helpers[i], records,
-                        rewriter);
-    }
+    applyXorIInPlace(helpers, storageMap.at(lhs), loc, rewriter, true, records);
+    applyXorIInPlace(helpers, storageMap.at(rhs), loc, rewriter, true, records);
   } else if (auto andiOp = dyn_cast<arith::AndIOp>(op)) {
     auto lhs = andiOp.getOperand(0);
     auto rhs = andiOp.getOperand(1);
@@ -298,32 +342,19 @@ void emitTemporary(Operation* op,
       emitGateAndRecord(loc, {storageMap.at(lhs)[i], storageMap.at(rhs)[i]},
                         helpers[i], records, rewriter);
     }
+  } else if (auto addiOp = dyn_cast<arith::AddIOp>(op)) {
+    auto lhs = addiOp.getOperand(0);
+    auto rhs = addiOp.getOperand(1);
+    for (size_t i = 0; i < bitWidth; ++i) {
+      emitGateAndRecord(loc, {storageMap.at(lhs)[i]}, helpers[i], records,
+                        rewriter);
+    }
+    applyAddIInPlace(helpers, storageMap.at(rhs), loc, rewriter, true, records);
   } else {
-    llvm_unreachable("addi temporaries are not lowered yet");
+    llvm_unreachable(
+        "cannot lower qoracle because the operation is not supported");
   }
   storageMap[res] = std::move(helpers);
-}
-
-void updateXorI(ArrayRef<Value> overwrite, ArrayRef<Value> other, Location loc,
-                PatternRewriter& rewriter) {
-  auto bitWidth = overwrite.size();
-  for (size_t i = 0; i < bitWidth; i++) {
-    emitGate(loc, {other[i]}, overwrite[i], rewriter);
-  }
-}
-
-void updateAddI(ArrayRef<Value> overwrite, ArrayRef<Value> other, Location loc,
-                PatternRewriter& rewriter) {
-  auto bitWidth = overwrite.size();
-  for (size_t i = 0; i < bitWidth; i++) {
-    auto control = other[i];
-    for (size_t j = bitWidth - 1; j > i; j--) {
-      SmallVector<Value> args(overwrite.drop_front(i).take_front(j - i));
-      args.push_back(control);
-      emitGate(loc, args, overwrite[j], rewriter);
-    }
-    emitGate(loc, {other[i]}, overwrite[i], rewriter);
-  }
 }
 
 void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
@@ -358,11 +389,11 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
     }
 
     if (isa<arith::XOrIOp>(step.updateOp)) {
-      updateXorI(storageMap.at(step.overwriteValue),
-                 storageMap.at(step.otherValue), loc, rewriter);
+      applyXorIInPlace(storageMap.at(step.overwriteValue),
+                       storageMap.at(step.otherValue), loc, rewriter);
     } else if (isa<arith::AddIOp>(step.updateOp)) {
-      updateAddI(storageMap.at(step.overwriteValue),
-                 storageMap.at(step.otherValue), loc, rewriter);
+      applyAddIInPlace(storageMap.at(step.overwriteValue),
+                       storageMap.at(step.otherValue), loc, rewriter);
     } else {
       llvm_unreachable("other updates are not lowered");
     }
