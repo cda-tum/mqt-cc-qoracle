@@ -15,11 +15,13 @@ target_link_libraries(
           MLIRFuncDialect
           MLIRIR
           MLIRMemRefDialect
+          MLIRMQTDialect
           MLIRParser
           MLIRPass
           MLIRQCDialect
           MLIRQOracleDialect
           MLIRQOracleToQC
+          MLIRSCFDialect
           MLIRSupport)
 mqt_mlir_configure_unittest_target(${qoracle_to_qc_target})
 

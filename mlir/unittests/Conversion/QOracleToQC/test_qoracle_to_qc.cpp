@@ -12,6 +12,7 @@
 /// Unit tests for the QOracle-to-QC conversion.
 
 #include "mqt/Conversion/QOracleToQC/QOracleToQC.h"
+#include "mqt/Dialect/MQT/IR/MQTDialect.h"
 #include "mqt/Dialect/QC/IR/QCDialect.h"
 #include "mqt/Dialect/QC/IR/QCOps.h"
 #include "mqt/Dialect/QOracle/IR/QOracleDialect.h"
@@ -21,6 +22,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
@@ -60,7 +62,7 @@ using RegisterValues = SmallVector<uint64_t>;
 /// state, where each qubit holds a single bit.
 class BasisSimulator {
 public:
-  /// Run the entry block of `function`.
+  /// Run the body of `function`, repeating the body of each `scf.for`.
   ///
   /// Each allocation in `inputs` starts with the matching value of `initial`;
   /// every other qubit starts at 0. Fails if a qubit is used after its
@@ -76,10 +78,13 @@ private:
   DenseMap<Value, size_t> qubits_;
   DenseMap<Value, SmallVector<size_t>> registers_;
   DenseMap<Value, int64_t> indices_;
+  DenseMap<Operation*, uint64_t> initialValues_;
+  DenseMap<Operation*, SmallVector<size_t>> inputBits_;
 
   [[nodiscard]] SmallVector<size_t> allocate(size_t width, uint64_t value);
   [[nodiscard]] FailureOr<size_t> bitOf(Value qubit);
   [[nodiscard]] LogicalResult apply(Operation& op);
+  [[nodiscard]] LogicalResult runBlock(Block& block);
 };
 } // namespace
 
@@ -140,25 +145,29 @@ LogicalResult BasisSimulator::apply(Operation& op) {
   return failure();
 }
 
-FailureOr<RegisterValues> BasisSimulator::run(func::FuncOp function,
-                                              ArrayRef<Operation*> inputs,
-                                              ArrayRef<uint64_t> initial) {
-  DenseMap<Operation*, uint64_t> initialValues;
-  for (auto [input, value] : llvm::zip_equal(inputs, initial)) {
-    initialValues[input] = value;
-  }
-
-  DenseMap<Operation*, SmallVector<size_t>> inputBits;
-  for (auto& op : function.getBody().front()) {
+LogicalResult BasisSimulator::runBlock(Block& block) {
+  for (auto& op : block) {
     if (auto alloc = dyn_cast<memref::AllocOp>(op)) {
       auto allocated =
-          allocate(alloc.getType().getDimSize(0), initialValues.lookup(&op));
+          allocate(alloc.getType().getDimSize(0), initialValues_.lookup(&op));
       registers_[alloc.getResult()] = allocated;
-      inputBits[&op] = allocated;
+      inputBits_[&op] = allocated;
     } else if (auto alloc = dyn_cast<qc::AllocOp>(op)) {
-      auto allocated = allocate(1, initialValues.lookup(&op));
+      auto allocated = allocate(1, initialValues_.lookup(&op));
       qubits_[alloc.getResult()] = allocated.front();
-      inputBits[&op] = allocated;
+      inputBits_[&op] = allocated;
+    } else if (auto loop = dyn_cast<scf::ForOp>(op)) {
+      if (loop.getNumRegionIterArgs() != 0) {
+        ADD_FAILURE() << "loop carries values";
+        return failure();
+      }
+      const auto upper = indices_.at(loop.getUpperBound());
+      const auto step = indices_.at(loop.getStep());
+      for (auto i = indices_.at(loop.getLowerBound()); i < upper; i += step) {
+        if (failed(runBlock(*loop.getBody()))) {
+          return failure();
+        }
+      }
     } else if (auto constant = dyn_cast<arith::ConstantIndexOp>(op)) {
       indices_[constant.getResult()] = constant.value();
     } else if (isa<arith::ConstantOp>(op)) {
@@ -177,17 +186,29 @@ FailureOr<RegisterValues> BasisSimulator::run(func::FuncOp function,
         return failure();
       }
       live_[*bit] = false;
-    } else if (isa<func::ReturnOp>(op)) {
+    } else if (isa<func::ReturnOp, scf::YieldOp>(op)) {
       break;
     } else if (failed(apply(op))) {
       return failure();
     }
   }
+  return success();
+}
+
+FailureOr<RegisterValues> BasisSimulator::run(func::FuncOp function,
+                                              ArrayRef<Operation*> inputs,
+                                              ArrayRef<uint64_t> initial) {
+  for (auto [input, value] : llvm::zip_equal(inputs, initial)) {
+    initialValues_[input] = value;
+  }
+  if (failed(runBlock(function.getBody().front()))) {
+    return failure();
+  }
 
   RegisterValues final;
   for (auto* input : inputs) {
     uint64_t value = 0;
-    for (auto [i, bit] : llvm::enumerate(inputBits.at(input))) {
+    for (auto [i, bit] : llvm::enumerate(inputBits_.at(input))) {
       if (bits_[bit]) {
         value |= uint64_t{1} << i;
       }
@@ -206,9 +227,9 @@ protected:
 
   void SetUp() override {
     DialectRegistry registry;
-    registry
-        .insert<arith::ArithDialect, func::FuncDialect, memref::MemRefDialect,
-                qc::QCDialect, qoracle::QOracleDialect>();
+    registry.insert<arith::ArithDialect, func::FuncDialect,
+                    memref::MemRefDialect, mqt::MQTDialect, qc::QCDialect,
+                    qoracle::QOracleDialect, scf::SCFDialect>();
     context = std::make_unique<MLIRContext>(registry);
     context->loadAllAvailableDialects();
     handler = std::make_unique<ScopedDiagnosticHandler>(
@@ -219,12 +240,14 @@ protected:
         });
   }
 
-  /// Parse a function body wrapped in `@main`, which takes `arguments`.
+  /// Parse a function body wrapped in the entry point `@main`, which takes
+  /// `arguments`.
   [[nodiscard]] OwningOpRef<ModuleOp> parseBody(StringRef body,
                                                 StringRef arguments = "") {
     diagnostics.clear();
     const std::string source = "module {\nfunc.func @main(" + arguments.str() +
-                               ") {\n" + body.str() + "\nreturn\n}\n}";
+                               ") attributes {mqt.entry_point} {\n" +
+                               body.str() + "\nreturn\n}\n}";
     return parseSourceString<ModuleOp>(source, context.get());
   }
 
@@ -245,8 +268,8 @@ protected:
   /// initial register values to `expected(initial)`.
   ///
   /// The registers are the allocations in `body`, in program order. The
-  /// simulation also checks that every helper qubit is 0 when it is
-  /// deallocated.
+  /// check also requires the output to follow the MQT allocation rules and
+  /// every helper qubit to be 0 when it is deallocated.
   void expectLowersTo(
       StringRef body,
       llvm::function_ref<RegisterValues(ArrayRef<uint64_t>)> expected) {
@@ -274,6 +297,8 @@ protected:
     ASSERT_TRUE(runPass(*moduleOp)) << diagnostics;
     ASSERT_TRUE(succeeded(verify(*moduleOp))) << diagnostics;
     const auto lowered = print(*moduleOp);
+    ASSERT_TRUE(succeeded(mqt::verifyQuantumAllocations(*moduleOp)))
+        << diagnostics << lowered;
 
     for (uint64_t code = 0; code < (uint64_t{1} << totalBits); ++code) {
       RegisterValues initial;
@@ -759,4 +784,314 @@ TEST_F(QOracleToQCTest, RejectsCapturedMeasurementResult) {
       qoracle.yield %next : i1
     })mlir",
                  "captures a classical value that is not a constant");
+}
+
+TEST_F(QOracleToQCTest, RepeatsLoopBody) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %out = scf.for %i = %c0 to %c3 step %c1
+          iter_args(%acc = %vr) -> (i3) {
+        %next = arith.addi %acc, %va : i3
+        scf.yield %next : i3
+      }
+      qoracle.yield %out : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] + (3 * in[0])};
+                 });
+}
+
+TEST_F(QOracleToQCTest, RecomputesTemporariesInEachIteration) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %out:2 = scf.for %i = %c0 to %c3 step %c1
+          iter_args(%ix = %vx, %iy = %vy) -> (i2, i2) {
+        %t = arith.andi %ix, %va : i2
+        %y1 = arith.addi %iy, %t : i2
+        %x1 = arith.xori %ix, %vb : i2
+        scf.yield %x1, %y1 : i2, i2
+      }
+      qoracle.yield %out#0, %out#1 : i2, i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   auto x = in[2];
+                   auto y = in[3];
+                   for (int i = 0; i < 3; ++i) {
+                     y += x & in[0];
+                     x ^= in[1];
+                   }
+                   return {in[0], in[1], x, y};
+                 });
+}
+
+TEST_F(QOracleToQCTest, LowersLoopWithOffsetAndStep) {
+  expectLowersTo(
+      R"mlir(
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c6 = arith.constant 6 : index
+    qoracle.oracle consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %one = arith.constant 1 : i3
+      %out = scf.for %i = %c1 to %c6 step %c2
+          iter_args(%acc = %vr) -> (i3) {
+        %next = arith.addi %acc, %one : i3
+        scf.yield %next : i3
+      }
+      qoracle.yield %out : i3
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[0] + 3U}; });
+}
+
+TEST_F(QOracleToQCTest, LowersLoopWithoutIterations) {
+  expectLowersTo(
+      R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %out = scf.for %i = %c2 to %c2 step %c1
+          iter_args(%acc = %vr) -> (i2) {
+        %next = arith.addi %acc, %va : i2
+        scf.yield %next : i2
+      }
+      qoracle.yield %out : i2
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[0], in[1]}; });
+}
+
+TEST_F(QOracleToQCTest, LowersNestedLoops) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c3 = arith.constant 3 : index
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%outer = %vr) -> (i3) {
+        %inner = scf.for %j = %c0 to %c3 step %c1
+            iter_args(%acc = %outer) -> (i3) {
+          %ab = arith.andi %va, %vb : i3
+          %next = arith.addi %acc, %ab : i3
+          scf.yield %next : i3
+        }
+        scf.yield %inner : i3
+      }
+      qoracle.yield %out : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] + (6 * (in[0] & in[1]))};
+                 });
+}
+
+TEST_F(QOracleToQCTest, UpdatesBeforeAndAfterLoop) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %r1 = arith.xori %vr, %va : i3
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%acc = %r1) -> (i3) {
+        %next = arith.addi %acc, %vb : i3
+        scf.yield %next : i3
+      }
+      %r2 = arith.xori %out, %va : i3
+      qoracle.yield %r2 : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {
+                       in[0],
+                       in[1],
+                       ((in[2] ^ in[0]) + (2 * in[1])) ^ in[0],
+                   };
+                 });
+}
+
+TEST_F(QOracleToQCTest, UpdatesValueReadByEarlierLoop) {
+  expectLowersTo(R"mlir(
+    %k = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%k : memref<2x!qc.qubit> as %vk)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %out = scf.for %i = %c0 to %c3 step %c1
+          iter_args(%acc = %vy) -> (i2) {
+        %next = arith.addi %acc, %vx : i2
+        scf.yield %next : i2
+      }
+      %x1 = arith.xori %vx, %vk : i2
+      qoracle.yield %x1, %out : i2, i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ in[0], in[2] + (3 * in[1])};
+                 });
+}
+
+TEST_F(QOracleToQCTest, RejectsLoopUsingItsInductionVariable) {
+  expectRejected(R"mlir(
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %one = arith.constant 1 : i2
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%outer = %vr) -> (i2) {
+        %inner = scf.for %j = %c0 to %i step %c1
+            iter_args(%acc = %outer) -> (i2) {
+          %next = arith.addi %acc, %one : i2
+          scf.yield %next : i2
+        }
+        scf.yield %inner : i2
+      }
+      qoracle.yield %out : i2
+    })mlir",
+                 "uses its induction variable");
+}
+
+TEST_F(QOracleToQCTest, RejectsLoopReadingTemporaryFromOutside) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %ab = arith.andi %va, %vb : i2
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%acc = %vr) -> (i2) {
+        %next = arith.xori %acc, %ab : i2
+        scf.yield %next : i2
+      }
+      qoracle.yield %out : i2
+    })mlir",
+                 "neither stored in qubits nor a constant");
+}
+
+TEST_F(QOracleToQCTest, RejectsLoopReadingValueItOverwrites) {
+  expectRejected(R"mlir(
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%acc = %vr) -> (i2) {
+        %next = arith.addi %acc, %vr : i2
+        scf.yield %next : i2
+      }
+      qoracle.yield %out : i2
+    })mlir",
+                 "reads a value that it overwrites");
+}
+
+TEST_F(QOracleToQCTest, RejectsInitialValueReadAfterLoop) {
+  expectRejected(R"mlir(
+    %k = qc.alloc : !qc.qubit
+    %x = qc.alloc : !qc.qubit
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%k : !qc.qubit as %vk)
+                   consumed(%x : !qc.qubit as %vx, %y : !qc.qubit as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%acc = %vx) -> (i1) {
+        %next = arith.xori %acc, %vk : i1
+        scf.yield %next : i1
+      }
+      %y1 = arith.xori %vy, %vx : i1
+      qoracle.yield %out, %y1 : i1, i1
+    })mlir",
+                 "initial value is read after the loop");
+}
+
+TEST_F(QOracleToQCTest, RejectsLoopSwappingIterationArguments) {
+  expectRejected(R"mlir(
+    %x = qc.alloc : !qc.qubit
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle consumed(%x : !qc.qubit as %vx, %y : !qc.qubit as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %out:2 = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%p = %vx, %q = %vy) -> (i1, i1) {
+        scf.yield %q, %p : i1, i1
+      }
+      qoracle.yield %out#0, %out#1 : i1, i1
+    })mlir",
+                 "loop yields value 0");
+}
+
+TEST_F(QOracleToQCTest, LeavesLoopsOutsideOraclesUnchanged) {
+  expectLowersTo(
+      R"mlir(
+    %q = qc.alloc : !qc.qubit
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c3 = arith.constant 3 : index
+    scf.for %i = %c0 to %c3 step %c1 {
+      qc.x %q : !qc.qubit
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[0] ^ 1U}; });
+}
+
+TEST_F(QOracleToQCTest, NeverOverwritesOuterValueInsideLoop) {
+  expectLowersTo(R"mlir(
+    %k = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%k : memref<2x!qc.qubit> as %vk)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %out = scf.for %i = %c0 to %c3 step %c1
+          iter_args(%acc = %vy) -> (i2) {
+        %next = arith.addi %vx, %acc : i2
+        scf.yield %next : i2
+      }
+      %x1 = arith.xori %vx, %vk : i2
+      qoracle.yield %x1, %out : i2, i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ in[0], in[2] + (3 * in[1])};
+                 });
 }

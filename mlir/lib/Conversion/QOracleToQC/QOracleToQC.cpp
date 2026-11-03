@@ -62,6 +62,7 @@ struct UpdateStep {
   Value overwriteValue;
   Value otherValue;
   SmallVector<Operation*> temporaries;
+  std::vector<UpdateStep> body;
 };
 
 struct RecordedGate {
@@ -102,6 +103,14 @@ reachableTemporaries(Value source, DenseMap<Value, Value>& containers) {
   return temporaries;
 }
 
+bool isLastReader(Operation* op, Value value) {
+  auto* block = op->getBlock();
+  return llvm::all_of(value.getUsers(), [&](Operation* user) {
+    auto* ancestor = block->findAncestorOpInBlock(*user);
+    return ancestor == op || ancestor->isBeforeInBlock(op);
+  });
+}
+
 std::pair<Value, Value> operandToOverwrite(Operation* op,
                                            DenseMap<Value, Value>& containers) {
   if (!isa<arith::XOrIOp, arith::AddIOp>(op)) {
@@ -113,9 +122,7 @@ std::pair<Value, Value> operandToOverwrite(Operation* op,
     if (!containers.contains(value)) {
       continue;
     }
-    if (!llvm::all_of(value.getUsers(), [&](Operation* user) {
-          return user == op || user->isBeforeInBlock(op);
-        })) {
+    if (value.getParentBlock() != op->getBlock() || !isLastReader(op, value)) {
       continue;
     }
     overwriteIndex = i;
@@ -133,60 +140,114 @@ std::pair<Value, Value> operandToOverwrite(Operation* op,
   return {toOverwrite, other};
 }
 
-FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
-  SmallVector<UpdateStep> updateSteps;
-  DenseMap<Value, Value> containers;
-  for (auto consumed : oracle.getConsumedAliases()) {
-    containers[consumed] = consumed;
+FailureOr<SmallVector<UpdateStep>>
+planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers);
+
+FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
+                               DenseMap<Value, Value>& containers) {
+  if (!forOp.getInductionVar().use_empty()) {
+    oracle.emitOpError(
+        "cannot lower qoracle because a loop uses its induction variable");
+    return failure();
+  }
+  for (auto [init, iterArg] :
+       llvm::zip_equal(forOp.getInitArgs(), forOp.getRegionIterArgs())) {
+    if (!containers.contains(init)) {
+      oracle.emitOpError(
+          "cannot lower qoracle because a loop initial value is not stored in "
+          "consumed qubits");
+      return failure();
+    }
+    if (!isLastReader(forOp, init)) {
+      oracle.emitOpError(
+          "cannot lower qoracle because a loop initial value is read after "
+          "the loop");
+      return failure();
+    }
+    containers[iterArg] = containers[init];
   }
 
   llvm::SetVector<Value> captured;
-  getUsedValuesDefinedAbove(oracle.getRegion(), captured);
+  getUsedValuesDefinedAbove(forOp.getRegion(), captured);
   for (auto value : captured) {
-    if (!matchPattern(value, m_Constant())) {
-      oracle.emitOpError("cannot lower qoracle because it captures a "
-                         "classical value that is not a constant");
+    if (llvm::is_contained(forOp.getInitArgs(), value)) {
+      oracle.emitOpError(
+          "cannot lower qoracle because a loop reads a value that it "
+          "overwrites");
+      return failure();
+    }
+    auto isAlias = llvm::is_contained(oracle.getRegion().getArguments(), value);
+    auto isContainer = containers.contains(value);
+    auto isConstant = matchPattern(value, m_Constant());
+    if (!isAlias && !isContainer && !isConstant) {
+      oracle.emitOpError(
+          "cannot lower qoracle because a loop reads a value that is neither "
+          "stored in qubits nor a constant");
       return failure();
     }
   }
 
-  qoracle::YieldOp yield =
-      llvm::cast<qoracle::YieldOp>(oracle.getRegion().front().getTerminator());
-
-  if (oracle.getRegion()
-          .walk([&](Operation* op) {
-            if (isa<qoracle::YieldOp>(op)) {
-              return WalkResult::advance();
-            }
-            auto [overwriteValue, other] = operandToOverwrite(op, containers);
-            auto temporaries = reachableTemporaries(other, containers);
-            if (!overwriteValue) {
-              return WalkResult::advance();
-            }
-
-            for (auto* tempOp : temporaries) {
-              if (llvm::is_contained(tempOp->getOperands(), overwriteValue)) {
-                return WalkResult::interrupt();
-              }
-            }
-
-            updateSteps.emplace_back(op, overwriteValue, other, temporaries);
-            containers[op->getResult(0)] = containers[overwriteValue];
-
-            return WalkResult::advance();
-          })
-          .wasInterrupted()) {
-    oracle.emitOpError("cannot lower qoracle because a temporary depends on "
-                       "the value to be overwritten");
+  auto body = planBlock(forOp.getBodyRegion().front(), oracle, containers);
+  if (failed(body)) {
     return failure();
   }
 
-  for (auto [i, operand] : llvm::enumerate(yield.getOperands())) {
-    if (containers[operand] != oracle.getConsumedAliases()[i]) {
-      oracle.emitOpError("cannot lower qoracle because the yielded value ")
-          << i << " does not match the corresponding consumed alias";
+  for (auto [i, bodyYield, iterArg] :
+       llvm::enumerate(forOp.getBody()->getTerminator()->getOperands(),
+                       forOp.getRegionIterArgs())) {
+    if (containers[bodyYield] != containers[iterArg]) {
+      oracle.emitOpError("cannot lower qoracle because the loop yields value ")
+          << i << " into other qubits than its iteration argument";
       return failure();
     }
+  }
+
+  for (auto [result, init] :
+       llvm::zip_equal(forOp.getResults(), forOp.getInitArgs())) {
+    containers[result] = containers[init];
+  }
+
+  UpdateStep step{
+      .updateOp = forOp,
+      .overwriteValue = nullptr,
+      .otherValue = nullptr,
+      .temporaries = {},
+      .body = std::vector<UpdateStep>(std::make_move_iterator(body->begin()),
+                                      std::make_move_iterator(body->end())),
+  };
+  return step;
+}
+
+FailureOr<SmallVector<UpdateStep>>
+planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers) {
+  SmallVector<UpdateStep> updateSteps;
+  for (auto& op : block.without_terminator()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      auto step = planLoop(forOp, oracle, containers);
+      if (failed(step)) {
+        return failure();
+      }
+      updateSteps.push_back(std::move(*step));
+      continue;
+    }
+
+    auto [overwriteValue, other] = operandToOverwrite(&op, containers);
+    auto temporaries = reachableTemporaries(other, containers);
+    if (!overwriteValue) {
+      continue;
+    }
+
+    for (auto* tempOp : temporaries) {
+      if (llvm::is_contained(tempOp->getOperands(), overwriteValue)) {
+        oracle.emitOpError(
+            "cannot lower qoracle because a temporary depends on "
+            "the value to be overwritten");
+        return failure();
+      }
+    }
+
+    updateSteps.emplace_back(&op, overwriteValue, other, temporaries);
+    containers[op.getResult(0)] = containers[overwriteValue];
   }
 
   DenseSet<Value> overwritten;
@@ -204,6 +265,41 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
     overwritten.insert(step.overwriteValue);
   }
 
+  return updateSteps;
+}
+
+FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
+  DenseMap<Value, Value> containers;
+  for (auto consumed : oracle.getConsumedAliases()) {
+    containers[consumed] = consumed;
+  }
+
+  llvm::SetVector<Value> captured;
+  getUsedValuesDefinedAbove(oracle.getRegion(), captured);
+  for (auto value : captured) {
+    if (!matchPattern(value, m_Constant())) {
+      oracle.emitOpError("cannot lower qoracle because it captures a "
+                         "classical value that is not a constant");
+      return failure();
+    }
+  }
+
+  auto steps = planBlock(oracle.getRegion().front(), oracle, containers);
+  if (failed(steps)) {
+    return failure();
+  }
+  auto updateSteps = std::move(*steps);
+
+  qoracle::YieldOp yield =
+      llvm::cast<qoracle::YieldOp>(oracle.getRegion().front().getTerminator());
+  for (auto [i, operand] : llvm::enumerate(yield.getOperands())) {
+    if (containers[operand] != oracle.getConsumedAliases()[i]) {
+      oracle.emitOpError("cannot lower qoracle because the yielded value ")
+          << i << " does not match the corresponding consumed alias";
+      return failure();
+    }
+  }
+
   return success(updateSteps);
 }
 
@@ -212,7 +308,7 @@ bool validRegion(Block* block) {
           ->walk([&](Operation* op) {
             if (!isa<arith::ConstantOp, arith::XOrIOp, arith::AndIOp,
                      arith::AddIOp, arith::ExtUIOp, arith::TruncIOp,
-                     qoracle::YieldOp>(op)) {
+                     qoracle::YieldOp, scf::ForOp, scf::YieldOp>(op)) {
               return WalkResult::interrupt();
             }
             if (op->getNumOperands() == 2 &&
@@ -454,7 +550,7 @@ protected:
     ConversionTarget target(*context);
     target.addIllegalDialect<QOracleDialect>();
     target.addLegalDialect<qc::QCDialect, arith::ArithDialect,
-                           memref::MemRefDialect>();
+                           memref::MemRefDialect, scf::SCFDialect>();
 
     RewritePatternSet patterns(context);
     patterns.add<ConvertOracleOp>(context);
