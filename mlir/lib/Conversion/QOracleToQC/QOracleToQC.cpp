@@ -390,9 +390,18 @@ void applyAddIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
   applyAddIInPlace(overwrite, other, loc, rewriter, false, records);
 }
 
+Value allocateHelper(Operation* outerLoop, Location loc,
+                     PatternRewriter& rewriter) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  if (outerLoop != nullptr) {
+    rewriter.setInsertionPoint(outerLoop);
+  }
+  return qc::AllocOp::create(rewriter, loc);
+}
+
 void emitTemporary(Operation* op,
                    DenseMap<Value, SmallVector<Value>>& storageMap,
-                   SmallVector<RecordedGate>& records,
+                   SmallVector<RecordedGate>& records, Operation* outerLoop,
                    SmallVector<Value>& allocated, PatternRewriter& rewriter) {
   auto res = op->getResult(0);
   auto bitWidth = res.getType().getIntOrFloatBitWidth();
@@ -406,7 +415,7 @@ void emitTemporary(Operation* op,
       helpers.push_back(storageMap.at(operand)[i]);
     }
     for (size_t i = oldWidth; i < bitWidth; ++i) {
-      auto qubit = qc::AllocOp::create(rewriter, loc);
+      auto qubit = allocateHelper(outerLoop, loc, rewriter);
       helpers.push_back(qubit);
       allocated.push_back(qubit);
     }
@@ -424,7 +433,7 @@ void emitTemporary(Operation* op,
   }
 
   for (size_t i = 0; i < bitWidth; ++i) {
-    auto qubit = qc::AllocOp::create(rewriter, loc);
+    auto qubit = allocateHelper(outerLoop, loc, rewriter);
     helpers.push_back(qubit);
     allocated.push_back(qubit);
   }
@@ -463,6 +472,94 @@ void emitTemporary(Operation* op,
   storageMap[res] = std::move(helpers);
 }
 
+void emitSteps(OracleOp op, ArrayRef<UpdateStep> updateSteps,
+               Operation* outerLoop, Location loc,
+               DenseMap<Value, SmallVector<Value>>& storageMap,
+               SmallVector<Value>& loopHelpers, PatternRewriter& rewriter);
+
+void emitForLoop(OracleOp op, scf::ForOp forOp, Operation* outerLoop,
+                 const UpdateStep& step, Location loc,
+                 DenseMap<Value, SmallVector<Value>>& storageMap,
+                 SmallVector<Value>& loopHelpers, PatternRewriter& rewriter) {
+  for (auto [init, iterArg] :
+       llvm::zip_equal(forOp.getInitArgs(), forOp.getRegionIterArgs())) {
+    auto qubits = storageMap.at(init);
+    storageMap[iterArg] = qubits;
+  }
+
+  auto lowerBound = arith::ConstantIndexOp::create(
+      rewriter, loc, *getConstantIntValue(forOp.getLowerBound()));
+  auto upperBound = arith::ConstantIndexOp::create(
+      rewriter, loc, *getConstantIntValue(forOp.getUpperBound()));
+  auto stepValue = arith::ConstantIndexOp::create(
+      rewriter, loc, *getConstantIntValue(forOp.getStep()));
+
+  auto newForOp =
+      scf::ForOp::create(rewriter, loc, lowerBound, upperBound, stepValue);
+  rewriter.setInsertionPoint(newForOp.getBody()->getTerminator());
+  emitSteps(op, step.body, !outerLoop ? newForOp : outerLoop, loc, storageMap,
+            loopHelpers, rewriter);
+  rewriter.setInsertionPointAfter(newForOp);
+
+  for (auto [init, result] :
+       llvm::zip_equal(forOp.getInitArgs(), forOp.getResults())) {
+    auto qubits = storageMap.at(init);
+    storageMap[result] = qubits;
+  }
+
+  if (!outerLoop) {
+    for (auto qubit : loopHelpers) {
+      qc::DeallocOp::create(rewriter, loc, qubit);
+    }
+    loopHelpers.clear();
+  }
+}
+
+void emitSteps(OracleOp op, ArrayRef<UpdateStep> updateSteps,
+               Operation* outerLoop, Location loc,
+               DenseMap<Value, SmallVector<Value>>& storageMap,
+               SmallVector<Value>& loopHelpers, PatternRewriter& rewriter) {
+  for (const auto& step : updateSteps) {
+    if (auto forOp = dyn_cast<scf::ForOp>(step.updateOp)) {
+      emitForLoop(op, forOp, outerLoop, step, loc, storageMap, loopHelpers,
+                  rewriter);
+      continue;
+    }
+    SmallVector<RecordedGate> records;
+    SmallVector<Value> allocated;
+
+    for (auto* tempOp : step.temporaries) {
+      emitTemporary(tempOp, storageMap, records, outerLoop, allocated,
+                    rewriter);
+    }
+
+    if (isa<arith::XOrIOp>(step.updateOp)) {
+      applyXorIInPlace(storageMap.at(step.overwriteValue),
+                       storageMap.at(step.otherValue), loc, rewriter);
+    } else if (isa<arith::AddIOp>(step.updateOp)) {
+      applyAddIInPlace(storageMap.at(step.overwriteValue),
+                       storageMap.at(step.otherValue), loc, rewriter);
+    } else {
+      llvm_unreachable("other updates are not lowered");
+    }
+
+    for (const auto& rec : llvm::reverse(records)) {
+      emitGate(loc, rec.controls, rec.target, rewriter);
+    }
+
+    auto qubits = storageMap.at(step.overwriteValue);
+    storageMap[step.updateOp->getResult(0)] = qubits;
+
+    if (outerLoop != nullptr) {
+      llvm::append_range(loopHelpers, allocated);
+    } else {
+      for (auto qubit : allocated) {
+        qc::DeallocOp::create(rewriter, op->getLoc(), qubit);
+      }
+    }
+  }
+}
+
 void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
                    PatternRewriter& rewriter) {
   rewriter.setInsertionPoint(op);
@@ -486,35 +583,8 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
     }
   }
 
-  for (const auto& step : updateSteps) {
-    SmallVector<RecordedGate> records;
-    SmallVector<Value> allocated;
-
-    for (auto* tempOp : step.temporaries) {
-      emitTemporary(tempOp, storageMap, records, allocated, rewriter);
-    }
-
-    if (isa<arith::XOrIOp>(step.updateOp)) {
-      applyXorIInPlace(storageMap.at(step.overwriteValue),
-                       storageMap.at(step.otherValue), loc, rewriter);
-    } else if (isa<arith::AddIOp>(step.updateOp)) {
-      applyAddIInPlace(storageMap.at(step.overwriteValue),
-                       storageMap.at(step.otherValue), loc, rewriter);
-    } else {
-      llvm_unreachable("other updates are not lowered");
-    }
-
-    for (const auto& rec : llvm::reverse(records)) {
-      emitGate(loc, rec.controls, rec.target, rewriter);
-    }
-
-    for (auto qubit : allocated) {
-      qc::DeallocOp::create(rewriter, op->getLoc(), qubit);
-    }
-
-    storageMap[step.updateOp->getResult(0)] =
-        storageMap.at(step.overwriteValue);
-  }
+  SmallVector<Value> helpers;
+  emitSteps(op, updateSteps, nullptr, loc, storageMap, helpers, rewriter);
 }
 
 struct ConvertOracleOp final : OpConversionPattern<OracleOp> {
