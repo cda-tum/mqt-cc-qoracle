@@ -593,6 +593,15 @@ struct ConvertOracleOp final : OpConversionPattern<OracleOp> {
   LogicalResult
   matchAndRewrite(OracleOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter& rewriter) const override {
+    auto hasStatic =
+        op->getParentOfType<ModuleOp>()
+            .walk([](qc::StaticOp) { return WalkResult::interrupt(); })
+            .wasInterrupted();
+    if (hasStatic) {
+      op.emitOpError("cannot lower qoracle in a program with static qubits");
+      return failure();
+    }
+
     if (!validRegion(&op.getRegion().front())) {
       op->emitOpError("contains invalid operations");
       return failure();

@@ -1095,3 +1095,15 @@ TEST_F(QOracleToQCTest, NeverOverwritesOuterValueInsideLoop) {
                    return {in[0], in[1] ^ in[0], in[2] + (3 * in[1])};
                  });
 }
+
+TEST_F(QOracleToQCTest, RejectsProgramWithStaticQubits) {
+  expectRejected(R"mlir(
+    %k = qc.static 0 : !qc.qubit
+    %r = qc.static 1 : !qc.qubit
+    qoracle.oracle kept(%k : !qc.qubit as %vk)
+                   consumed(%r : !qc.qubit as %vr) {
+      %next = arith.xori %vr, %vk : i1
+      qoracle.yield %next : i1
+    })mlir",
+                 "in a program with static qubits");
+}
