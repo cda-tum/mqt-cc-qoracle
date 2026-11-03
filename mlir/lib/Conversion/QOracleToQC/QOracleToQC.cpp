@@ -65,10 +65,217 @@ struct UpdateStep {
   std::vector<UpdateStep> body;
 };
 
-struct RecordedGate {
-  SmallVector<Value> controls;
-  Value target;
+struct Bit {
+  Value word;
+  size_t index;
 };
+
+struct Statement {
+  enum class Kind { Temp, Update };
+  enum class Op { Xor, And };
+
+  Kind kind;
+  Op op;
+  Bit target;
+  SmallVector<Bit> operands;
+  bool invert = false;
+};
+
+Value allocateHelper(Operation* outerLoop, Location loc,
+                     PatternRewriter& rewriter) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  if (outerLoop != nullptr) {
+    rewriter.setInsertionPoint(outerLoop);
+  }
+  return qc::AllocOp::create(rewriter, loc);
+}
+
+void emitGate(Location loc, ArrayRef<Value> controls, Value target,
+              PatternRewriter& rewriter) {
+  if (!controls.empty()) {
+    qc::CtrlOp::create(rewriter, loc, controls, {target}, [&](ValueRange args) {
+      qc::XOp::create(rewriter, loc, args[0]);
+    });
+  } else {
+    qc::XOp::create(rewriter, loc, target);
+  }
+}
+
+SmallVector<Statement> createAdditionStatements(Value target, Value other,
+                                                Statement::Kind kind) {
+  SmallVector<Statement> statements;
+  auto bitWidth = target.getType().getIntOrFloatBitWidth();
+  for (size_t i = 0; i < bitWidth; ++i) {
+    for (size_t j = bitWidth - 1; j > i; j--) {
+      SmallVector<Bit> args;
+      for (size_t k = i; k < j; ++k) {
+        args.push_back({.word = target, .index = k});
+      }
+      args.push_back({.word = other, .index = i});
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::And,
+                            .target = {.word = target, .index = j},
+                            .operands = args});
+    }
+    statements.push_back({.kind = kind,
+                          .op = Statement::Op::Xor,
+                          .target = {.word = target, .index = i},
+                          .operands = {{.word = other, .index = i}}});
+  }
+  return statements;
+}
+
+SmallVector<Statement> buildStatements(const UpdateStep& update) {
+  SmallVector<Statement> statements;
+  for (const auto& temporary : update.temporaries) {
+    if (isa<arith::XOrIOp, arith::AndIOp>(temporary)) {
+      auto operation = isa<arith::XOrIOp>(temporary) ? Statement::Op::Xor
+                                                     : Statement::Op::And;
+      auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
+      for (size_t i = 0; i < bitWidth; ++i) {
+        statements.push_back(
+            {.kind = Statement::Kind::Temp,
+             .op = operation,
+             .target = {.word = temporary->getResult(0), .index = i},
+             .operands = {{.word = temporary->getOperand(0), .index = i},
+                          {.word = temporary->getOperand(1), .index = i}}});
+      }
+    } else if (auto constOp = dyn_cast<arith::ConstantOp>(temporary)) {
+      auto constantValue = cast<IntegerAttr>(constOp.getValue()).getValue();
+      auto bitWidth = constOp.getType().getIntOrFloatBitWidth();
+      for (size_t i = 0; i < bitWidth; ++i) {
+        if (!constantValue[i]) {
+          continue;
+        }
+        statements.push_back(
+            {.kind = Statement::Kind::Temp,
+             .op = Statement::Op::Xor,
+             .target = {.word = temporary->getResult(0), .index = i},
+             .operands = {},
+             .invert = true});
+      }
+    } else if (auto addiOp = dyn_cast<arith::AddIOp>(temporary)) {
+      auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
+      for (size_t i = 0; i < bitWidth; ++i) {
+        statements.push_back(
+            {.kind = Statement::Kind::Temp,
+             .op = Statement::Op::Xor,
+             .target = {.word = temporary->getResult(0), .index = i},
+             .operands = {{.word = temporary->getOperand(0), .index = i}}});
+      }
+      auto additionStatements = createAdditionStatements(
+          temporary->getResult(0), temporary->getOperand(1),
+          Statement::Kind::Temp);
+      statements.append(additionStatements.begin(), additionStatements.end());
+    } else if (!isa<arith::ExtUIOp, arith::TruncIOp>(temporary)) {
+      llvm_unreachable("Unexpected temporary operation");
+    }
+  }
+
+  if (isa<arith::XOrIOp>(update.updateOp)) {
+    auto bitWidth =
+        update.updateOp->getResult(0).getType().getIntOrFloatBitWidth();
+    for (size_t i = 0; i < bitWidth; ++i) {
+      statements.push_back(
+          {.kind = Statement::Kind::Update,
+           .op = Statement::Op::Xor,
+           .target = {.word = update.overwriteValue, .index = i},
+           .operands = {{.word = update.otherValue, .index = i}}});
+    }
+  } else if (isa<arith::AddIOp>(update.updateOp)) {
+    auto additionStatements = createAdditionStatements(
+        update.overwriteValue, update.otherValue, Statement::Kind::Update);
+    statements.append(additionStatements.begin(), additionStatements.end());
+  } else {
+    llvm_unreachable("Unexpected update operation");
+  }
+  return statements;
+}
+
+void emitStatement(const Statement& statement,
+                   DenseMap<Value, SmallVector<Value>>& storageMap,
+                   Location loc, PatternRewriter& rewriter) {
+  auto target = storageMap.at(statement.target.word)[statement.target.index];
+  auto controls = SmallVector<Value>();
+  for (const auto& operand : statement.operands) {
+    controls.push_back(storageMap.at(operand.word)[operand.index]);
+  }
+  if (statement.op == Statement::Op::And) {
+    emitGate(loc, controls, target, rewriter);
+  } else if (statement.op == Statement::Op::Xor) {
+    for (const auto& control : controls) {
+      emitGate(loc, {control}, target, rewriter);
+    }
+    if (statement.invert) {
+      emitGate(loc, {}, target, rewriter);
+    }
+  }
+}
+
+void emitUpdateStep(const UpdateStep& step,
+                    DenseMap<Value, SmallVector<Value>>& storageMap,
+                    Location loc, Operation* outerLoop,
+                    SmallVector<Value>& loopHelpers,
+                    PatternRewriter& rewriter) {
+  SmallVector<Value> allocated;
+
+  for (auto* temporary : step.temporaries) {
+    SmallVector<Value> helpers;
+    auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
+    if (auto extuiOp = dyn_cast<arith::ExtUIOp>(temporary)) {
+      auto operand = extuiOp.getOperand();
+      auto oldWidth = operand.getType().getIntOrFloatBitWidth();
+      for (size_t i = 0; i < oldWidth; ++i) {
+        helpers.push_back(storageMap.at(operand)[i]);
+      }
+      for (size_t i = oldWidth; i < bitWidth; ++i) {
+        auto qubit = allocateHelper(outerLoop, loc, rewriter);
+        helpers.push_back(qubit);
+        allocated.push_back(qubit);
+      }
+      storageMap[extuiOp.getResult()] = std::move(helpers);
+      continue;
+    }
+    if (auto truncOp = dyn_cast<arith::TruncIOp>(temporary)) {
+      auto operand = truncOp.getOperand();
+      for (size_t i = 0; i < bitWidth; ++i) {
+        helpers.push_back(storageMap.at(operand)[i]);
+      }
+      storageMap[truncOp.getResult()] = std::move(helpers);
+      continue;
+    }
+
+    for (size_t i = 0; i < bitWidth; ++i) {
+      auto qubit = allocateHelper(outerLoop, loc, rewriter);
+      helpers.push_back(qubit);
+      allocated.push_back(qubit);
+    }
+    storageMap[temporary->getResult(0)] = std::move(helpers);
+  }
+
+  auto statements = buildStatements(step);
+
+  for (const auto& statement : statements) {
+    emitStatement(statement, storageMap, loc, rewriter);
+  }
+
+  for (const auto& statement : llvm::reverse(statements)) {
+    if (statement.kind == Statement::Kind::Temp) {
+      emitStatement(statement, storageMap, loc, rewriter);
+    }
+  }
+
+  auto qubits = storageMap.at(step.overwriteValue);
+  storageMap[step.updateOp->getResult(0)] = qubits;
+
+  if (outerLoop != nullptr) {
+    llvm::append_range(loopHelpers, allocated);
+  } else {
+    for (auto qubit : allocated) {
+      qc::DeallocOp::create(rewriter, loc, qubit);
+    }
+  }
+}
 
 SmallVector<Operation*>
 reachableTemporaries(Value source, DenseMap<Value, Value>& containers) {
@@ -324,154 +531,6 @@ bool validRegion(Block* block) {
   return true;
 }
 
-void emitGate(Location loc, ArrayRef<Value> controls, Value target,
-              PatternRewriter& rewriter) {
-  if (!controls.empty()) {
-    qc::CtrlOp::create(rewriter, loc, controls, {target}, [&](ValueRange args) {
-      qc::XOp::create(rewriter, loc, args[0]);
-    });
-  } else {
-    qc::XOp::create(rewriter, loc, target);
-  }
-}
-
-void emitGateAndRecord(Location loc, ArrayRef<Value> controls, Value target,
-                       SmallVector<RecordedGate>& records,
-                       PatternRewriter& rewriter) {
-  emitGate(loc, controls, target, rewriter);
-  records.emplace_back(llvm::to_vector(controls), target);
-}
-
-void applyXorIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
-                      Location loc, PatternRewriter& rewriter, bool record,
-                      SmallVector<RecordedGate>& records) {
-  auto bitWidth = overwrite.size();
-  for (size_t i = 0; i < bitWidth; i++) {
-    if (record) {
-      emitGateAndRecord(loc, {other[i]}, overwrite[i], records, rewriter);
-    } else {
-      emitGate(loc, {other[i]}, overwrite[i], rewriter);
-    }
-  }
-}
-
-void applyXorIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
-                      Location loc, PatternRewriter& rewriter) {
-  SmallVector<RecordedGate> records;
-  applyXorIInPlace(overwrite, other, loc, rewriter, false, records);
-}
-
-void applyAddIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
-                      Location loc, PatternRewriter& rewriter, bool record,
-                      SmallVector<RecordedGate>& records) {
-  auto bitWidth = overwrite.size();
-  for (size_t i = 0; i < bitWidth; i++) {
-    auto control = other[i];
-    for (size_t j = bitWidth - 1; j > i; j--) {
-      SmallVector<Value> args(overwrite.drop_front(i).take_front(j - i));
-      args.push_back(control);
-      if (record) {
-        emitGateAndRecord(loc, args, overwrite[j], records, rewriter);
-      } else {
-        emitGate(loc, args, overwrite[j], rewriter);
-      }
-    }
-    if (record) {
-      emitGateAndRecord(loc, {control}, overwrite[i], records, rewriter);
-    } else {
-      emitGate(loc, {control}, overwrite[i], rewriter);
-    }
-  }
-}
-
-void applyAddIInPlace(ArrayRef<Value> overwrite, ArrayRef<Value> other,
-                      Location loc, PatternRewriter& rewriter) {
-  SmallVector<RecordedGate> records;
-  applyAddIInPlace(overwrite, other, loc, rewriter, false, records);
-}
-
-Value allocateHelper(Operation* outerLoop, Location loc,
-                     PatternRewriter& rewriter) {
-  OpBuilder::InsertionGuard guard(rewriter);
-  if (outerLoop != nullptr) {
-    rewriter.setInsertionPoint(outerLoop);
-  }
-  return qc::AllocOp::create(rewriter, loc);
-}
-
-void emitTemporary(Operation* op,
-                   DenseMap<Value, SmallVector<Value>>& storageMap,
-                   SmallVector<RecordedGate>& records, Operation* outerLoop,
-                   SmallVector<Value>& allocated, PatternRewriter& rewriter) {
-  auto res = op->getResult(0);
-  auto bitWidth = res.getType().getIntOrFloatBitWidth();
-  auto loc = op->getLoc();
-  SmallVector<Value> helpers;
-
-  if (auto extuiOp = dyn_cast<arith::ExtUIOp>(op)) {
-    auto operand = extuiOp.getOperand();
-    auto oldWidth = operand.getType().getIntOrFloatBitWidth();
-    for (size_t i = 0; i < oldWidth; ++i) {
-      helpers.push_back(storageMap.at(operand)[i]);
-    }
-    for (size_t i = oldWidth; i < bitWidth; ++i) {
-      auto qubit = allocateHelper(outerLoop, loc, rewriter);
-      helpers.push_back(qubit);
-      allocated.push_back(qubit);
-    }
-    storageMap[res] = std::move(helpers);
-    return;
-  }
-
-  if (auto truncOp = dyn_cast<arith::TruncIOp>(op)) {
-    auto operand = truncOp.getOperand();
-    for (size_t i = 0; i < bitWidth; ++i) {
-      helpers.push_back(storageMap.at(operand)[i]);
-    }
-    storageMap[res] = std::move(helpers);
-    return;
-  }
-
-  for (size_t i = 0; i < bitWidth; ++i) {
-    auto qubit = allocateHelper(outerLoop, loc, rewriter);
-    helpers.push_back(qubit);
-    allocated.push_back(qubit);
-  }
-
-  if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
-    auto value = cast<IntegerAttr>(constOp.getValue()).getValue();
-    for (size_t i = 0; i < bitWidth; ++i) {
-      if (value[i]) {
-        emitGateAndRecord(loc, {}, helpers[i], records, rewriter);
-      }
-    }
-  } else if (auto xoriOp = dyn_cast<arith::XOrIOp>(op)) {
-    auto lhs = xoriOp.getOperand(0);
-    auto rhs = xoriOp.getOperand(1);
-    applyXorIInPlace(helpers, storageMap.at(lhs), loc, rewriter, true, records);
-    applyXorIInPlace(helpers, storageMap.at(rhs), loc, rewriter, true, records);
-  } else if (auto andiOp = dyn_cast<arith::AndIOp>(op)) {
-    auto lhs = andiOp.getOperand(0);
-    auto rhs = andiOp.getOperand(1);
-    for (size_t i = 0; i < bitWidth; ++i) {
-      emitGateAndRecord(loc, {storageMap.at(lhs)[i], storageMap.at(rhs)[i]},
-                        helpers[i], records, rewriter);
-    }
-  } else if (auto addiOp = dyn_cast<arith::AddIOp>(op)) {
-    auto lhs = addiOp.getOperand(0);
-    auto rhs = addiOp.getOperand(1);
-    for (size_t i = 0; i < bitWidth; ++i) {
-      emitGateAndRecord(loc, {storageMap.at(lhs)[i]}, helpers[i], records,
-                        rewriter);
-    }
-    applyAddIInPlace(helpers, storageMap.at(rhs), loc, rewriter, true, records);
-  } else {
-    llvm_unreachable(
-        "cannot lower qoracle because the operation is not supported");
-  }
-  storageMap[res] = std::move(helpers);
-}
-
 void emitSteps(OracleOp op, ArrayRef<UpdateStep> updateSteps,
                Operation* outerLoop, Location loc,
                DenseMap<Value, SmallVector<Value>>& storageMap,
@@ -525,38 +584,7 @@ void emitSteps(OracleOp op, ArrayRef<UpdateStep> updateSteps,
                   rewriter);
       continue;
     }
-    SmallVector<RecordedGate> records;
-    SmallVector<Value> allocated;
-
-    for (auto* tempOp : step.temporaries) {
-      emitTemporary(tempOp, storageMap, records, outerLoop, allocated,
-                    rewriter);
-    }
-
-    if (isa<arith::XOrIOp>(step.updateOp)) {
-      applyXorIInPlace(storageMap.at(step.overwriteValue),
-                       storageMap.at(step.otherValue), loc, rewriter);
-    } else if (isa<arith::AddIOp>(step.updateOp)) {
-      applyAddIInPlace(storageMap.at(step.overwriteValue),
-                       storageMap.at(step.otherValue), loc, rewriter);
-    } else {
-      llvm_unreachable("other updates are not lowered");
-    }
-
-    for (const auto& rec : llvm::reverse(records)) {
-      emitGate(loc, rec.controls, rec.target, rewriter);
-    }
-
-    auto qubits = storageMap.at(step.overwriteValue);
-    storageMap[step.updateOp->getResult(0)] = qubits;
-
-    if (outerLoop != nullptr) {
-      llvm::append_range(loopHelpers, allocated);
-    } else {
-      for (auto qubit : allocated) {
-        qc::DeallocOp::create(rewriter, op->getLoc(), qubit);
-      }
-    }
+    emitUpdateStep(step, storageMap, loc, outerLoop, loopHelpers, rewriter);
   }
 }
 
