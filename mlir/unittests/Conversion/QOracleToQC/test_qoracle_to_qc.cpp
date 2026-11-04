@@ -58,8 +58,15 @@ constexpr unsigned MAX_INPUT_BITS = 16;
 /// The value of each register, bit 0 being the qubit at index 0.
 using RegisterValues = SmallVector<uint64_t>;
 
-/// Simulation of a circuit of X gates with controls on a computational basis
-/// state, where each qubit holds a single bit.
+/// Rotate the `width`-bit `value` left by `amount`.
+uint64_t rotl(uint64_t value, unsigned amount, unsigned width) {
+  const auto mask = (uint64_t{1} << width) - 1;
+  value &= mask;
+  return ((value << amount) | (value >> (width - amount))) & mask;
+}
+
+/// Simulation of a circuit of X and SWAP gates with controls on a
+/// computational basis state, where each qubit holds a single bit.
 class BasisSimulator {
 public:
   /// Run the body of `function`, repeating the body of each `scf.for`.
@@ -115,6 +122,17 @@ LogicalResult BasisSimulator::apply(Operation& op) {
       return failure();
     }
     bits_[*bit] = !bits_[*bit];
+    return success();
+  }
+  if (auto swap = dyn_cast<qc::SWAPOp>(op)) {
+    auto first = bitOf(swap.getQubit0In());
+    auto second = bitOf(swap.getQubit1In());
+    if (failed(first) || failed(second)) {
+      return failure();
+    }
+    const bool value = bits_[*first];
+    bits_[*first] = bits_[*second];
+    bits_[*second] = value;
     return success();
   }
   if (auto ctrl = dyn_cast<qc::CtrlOp>(op)) {
@@ -956,6 +974,361 @@ TEST_F(QOracleToQCTest, RejectsLoopOverKeptRegister) {
                  "a loop initial value is not stored in consumed qubits");
   EXPECT_EQ(StringRef(diagnostics).count("cannot lower qoracle"), 1U)
       << diagnostics;
+}
+
+// A rotation by a constant moves no data; the consumed register is sorted
+// into bit order at the end of the oracle.
+TEST_F(QOracleToQCTest, RotatesConsumedRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %t = arith.xori %vd, %va : i4
+      %hi = arith.shli %t, %c1 : i4
+      %lo = arith.shrui %t, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      qoracle.yield %rot : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], rotl(in[1] ^ in[0], 1, 4)};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+TEST_F(QOracleToQCTest, RecognizesRotationWithSwappedOperands) {
+  expectLowersTo(
+      R"mlir(
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %vd, %c3 : i4
+      %lo = arith.shrui %vd, %c1 : i4
+      %rot = arith.ori %lo, %hi : i4
+      qoracle.yield %rot : i4
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues {
+        return {rotl(in[0], 3, 4)};
+      });
+}
+
+TEST_F(QOracleToQCTest, ComposesRotations) {
+  expectLowersTo(
+      R"mlir(
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c1 = arith.constant 1 : i4
+      %c2 = arith.constant 2 : i4
+      %c3 = arith.constant 3 : i4
+      %hi1 = arith.shli %vd, %c1 : i4
+      %lo1 = arith.shrui %vd, %c3 : i4
+      %rot1 = arith.ori %hi1, %lo1 : i4
+      %hi2 = arith.shli %rot1, %c2 : i4
+      %lo2 = arith.shrui %rot1, %c2 : i4
+      %rot2 = arith.ori %hi2, %lo2 : i4
+      qoracle.yield %rot2 : i4
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues {
+        return {rotl(in[0], 3, 4)};
+      });
+}
+
+// Addition is sensitive to bit order, so it must read the rotated register
+// in rotated order.
+TEST_F(QOracleToQCTest, AddsIntoRotatedRegister) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %vd, %c1 : i4
+      %lo = arith.shrui %vd, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %next = arith.addi %rot, %va : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], rotl(in[1], 1, 4) + in[0]};
+                 });
+}
+
+// The shape of a ChaCha quarter-round step: the rotated register is the
+// operand of an addition into another register.
+TEST_F(QOracleToQCTest, AddsRotatedRegisterIntoOtherRegister) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %c = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%c : memref<4x!qc.qubit> as %vc,
+                            %d : memref<4x!qc.qubit> as %vd) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %t = arith.xori %vd, %va : i4
+      %hi = arith.shli %t, %c1 : i4
+      %lo = arith.shrui %t, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %nextC = arith.addi %vc, %rot : i4
+      qoracle.yield %nextC, %rot : i4, i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   const auto rotated = rotl(in[2] ^ in[0], 1, 4);
+                   return {in[0], in[1] + rotated, rotated};
+                 });
+}
+
+// The rotation is not the last reader of `d`, so it is a temporary that
+// shares the qubits of `d`.
+TEST_F(QOracleToQCTest, ReadsRegisterThroughRotationBeforeUpdatingIt) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%d : memref<4x!qc.qubit> as %vd,
+                            %r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %vd, %c1 : i4
+      %lo = arith.shrui %vd, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %nextR = arith.xori %vr, %rot : i4
+      %nextD = arith.xori %vd, %va : i4
+      qoracle.yield %nextD, %nextR : i4, i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] ^ in[0], in[2] ^ rotl(in[1], 1, 4)};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+TEST_F(QOracleToQCTest, ReadsRotatedKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %va, %c1 : i4
+      %lo = arith.shrui %va, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %next = arith.xori %vr, %rot : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] ^ rotl(in[0], 1, 4)};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+TEST_F(QOracleToQCTest, RotatesTemporary) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %ab = arith.andi %va, %vb : i4
+      %hi = arith.shli %ab, %c1 : i4
+      %lo = arith.shrui %ab, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %next = arith.xori %vr, %rot : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] ^ rotl(in[0] & in[1], 1, 4)};
+                 });
+}
+
+// The borrowed register is updated in rotated order; R6 restores it in place.
+TEST_F(QOracleToQCTest, BorrowsRotatedKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %va, %c1 : i4
+      %lo = arith.shrui %va, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %sum = arith.addi %rot, %vb : i4
+      %next = arith.xori %vr, %sum : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (rotl(in[0], 1, 4) + in[1])};
+  });
+  // The addition and its inverse each need one carry helper.
+  EXPECT_EQ(countHelpers(body), 2U);
+}
+
+// The iteration argument must be in bit order again at the end of each
+// iteration.
+TEST_F(QOracleToQCTest, RotatesInsideLoop) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c0 = arith.constant 0 : index
+      %one = arith.constant 1 : index
+      %three = arith.constant 3 : index
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %out = scf.for %i = %c0 to %three step %one
+          iter_args(%acc = %vd) -> (i4) {
+        %t = arith.xori %acc, %va : i4
+        %hi = arith.shli %t, %c1 : i4
+        %lo = arith.shrui %t, %c3 : i4
+        %rot = arith.ori %hi, %lo : i4
+        scf.yield %rot : i4
+      }
+      qoracle.yield %out : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   auto value = in[1];
+                   for (int i = 0; i < 3; ++i) {
+                     value = rotl(value ^ in[0], 1, 4);
+                   }
+                   return {in[0], value};
+                 });
+}
+
+TEST_F(QOracleToQCTest, RejectsShiftOutsideRotation) {
+  expectRejected(R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %next = arith.shli %vr, %c1 : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 "contains invalid operations");
+}
+
+TEST_F(QOracleToQCTest, RejectsOrOutsideRotation) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %next = arith.ori %vr, %va : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 "contains invalid operations");
+}
+
+TEST_F(QOracleToQCTest, RejectsShiftAmountsThatDoNotFormRotation) {
+  expectRejected(R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c2 = arith.constant 2 : i4
+      %hi = arith.shli %vr, %c1 : i4
+      %lo = arith.shrui %vr, %c2 : i4
+      %next = arith.ori %hi, %lo : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 "contains invalid operations");
+}
+
+// `x >> 4` is poison for an i4, so this is not a rotation by 0.
+TEST_F(QOracleToQCTest, RejectsShiftByBitWidth) {
+  expectRejected(R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : i4
+      %c4 = arith.constant 4 : i4
+      %hi = arith.shli %vr, %c0 : i4
+      %lo = arith.shrui %vr, %c4 : i4
+      %next = arith.ori %hi, %lo : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 "contains invalid operations");
+}
+
+TEST_F(QOracleToQCTest, RejectsShiftsOfDifferentValues) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %vr, %c1 : i4
+      %lo = arith.shrui %va, %c3 : i4
+      %next = arith.ori %hi, %lo : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 "contains invalid operations");
+}
+
+// `r ^= rotl(r, 1)` cannot be computed in place: the rotation reads the
+// register that the update overwrites.
+TEST_F(QOracleToQCTest, RejectsXorWithOwnRotation) {
+  expectRejected(R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %vr, %c1 : i4
+      %lo = arith.shrui %vr, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %next = arith.xori %vr, %rot : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 "a temporary depends on the value to be overwritten");
+}
+
+// The rotation of `d` is read after `d` is overwritten.
+TEST_F(QOracleToQCTest, RejectsRotationOfValueOverwrittenEarlier) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%d : memref<4x!qc.qubit> as %vd,
+                            %r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %vd, %c1 : i4
+      %lo = arith.shrui %vd, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %nextD = arith.xori %vd, %va : i4
+      %nextR = arith.xori %vr, %rot : i4
+      qoracle.yield %nextD, %nextR : i4, i4
+    })mlir",
+                 "overwritten in a previous step");
+}
+
+// A shift with a second user computes more than the rotation.
+TEST_F(QOracleToQCTest, RejectsShiftReadOutsideRotation) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %va, %c1 : i4
+      %lo = arith.shrui %va, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %r1 = arith.xori %vr, %rot : i4
+      %r2 = arith.xori %r1, %hi : i4
+      qoracle.yield %r2 : i4
+    })mlir",
+                 "contains invalid operations");
 }
 
 TEST_F(QOracleToQCTest, RepeatsLoopBody) {
