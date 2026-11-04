@@ -530,6 +530,29 @@ TEST_F(QOracleToQCTest, AddsKeptRegisterIntoConsumedRegister) {
                  });
 }
 
+// R2 computes every carry above the first into a qubit of the addition, so an
+// update with `+` needs one helper, as in Cuccaro's adder.
+TEST_F(QOracleToQCTest, AddsWithOneHelper) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %next = arith.addi %vr, %va : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] + in[0]};
+  });
+
+  auto moduleOp = parseBody(body);
+  ASSERT_TRUE(moduleOp) << diagnostics;
+  ASSERT_TRUE(runPass(*moduleOp)) << diagnostics;
+  size_t helpers = 0;
+  moduleOp->walk([&](qc::AllocOp) { ++helpers; });
+  EXPECT_EQ(helpers, 1U) << print(*moduleOp);
+}
+
 TEST_F(QOracleToQCTest, AddsIntoRightOperand) {
   expectLowersTo(R"mlir(
     %a = memref.alloc() : memref<3x!qc.qubit>

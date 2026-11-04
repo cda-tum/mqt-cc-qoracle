@@ -74,6 +74,8 @@ struct Statement {
   Value target;
   SmallVector<Value> operands;
   bool invert = false;
+  bool inPlace = false;
+  bool fused = false;
 };
 
 struct HelperAllocator {
@@ -101,6 +103,11 @@ struct HelperAllocator {
         qc::DeallocOp::create(rewriter, loc, qubit);
       }
     }
+  }
+
+  void discard(Value qubit) {
+    llvm::erase(allocated, qubit);
+    rewriter.eraseOp(qubit.getDefiningOp());
   }
 };
 
@@ -249,6 +256,13 @@ void emitStatement(const Statement& statement, Location loc,
     if (statement.invert) {
       emitGate(loc, {}, target, rewriter);
     }
+  } else if (statement.inPlace) {
+    auto x = statement.target;
+    auto y = statement.operands[0];
+    auto z = statement.operands[1];
+    emitGate(loc, {x}, y, rewriter);
+    emitGate(loc, {x}, z, rewriter);
+    emitGate(loc, {y, z}, x, rewriter);
   } else if (statement.op == Statement::Op::Maj) {
     assert(statement.operands.size() == 3 &&
            "maj takes exactly three operands");
@@ -298,11 +312,29 @@ SmallVector<size_t> rollbackStatement(ArrayRef<Statement> statements,
   return pickedStatements;
 }
 
+void emitGadgetCleanup(const Statement& statement, Location loc,
+                       PatternRewriter& rewriter) {
+  auto x = statement.target;
+  auto y = statement.operands[0];
+  auto z = statement.operands[1];
+  emitGate(loc, {y, z}, x, rewriter);
+  emitGate(loc, {x}, z, rewriter);
+  if (statement.fused) {
+    emitGate(loc, {z}, y, rewriter);
+  } else {
+    emitGate(loc, {x}, y, rewriter);
+  }
+}
+
 void temporaryCleanup(ArrayRef<Statement> statements, Location loc,
                       PatternRewriter& rewriter) {
   for (size_t i = statements.size(); i-- > 0;) {
     const auto& statement = statements[i];
     if (statement.kind != Statement::Kind::Temp) {
+      continue;
+    }
+    if (statement.inPlace) {
+      emitGadgetCleanup(statement, loc, rewriter);
       continue;
     }
     auto toRollBack = rollbackStatement(statements, i);
@@ -320,6 +352,96 @@ void temporaryCleanup(ArrayRef<Statement> statements, Location loc,
              "rollback reads an already cleaned temporary");
 
       emitStatement(statements[j], loc, rewriter);
+    }
+  }
+}
+
+void makeGadgets(SmallVector<Statement>& statements,
+                 HelperAllocator& allocator) {
+  for (size_t i = 0; i < statements.size(); i++) {
+    const auto& statement = statements[i];
+    if (statement.kind != Statement::Kind::Temp) {
+      continue;
+    }
+    if (statement.op != Statement::Op::Maj) {
+      continue;
+    }
+
+    auto target = statement.target;
+    bool done = false;
+    auto operands = statement.operands;
+    for (auto x : operands) {
+      if (done) {
+        break;
+      }
+      for (auto y : operands) {
+        if (x == y) {
+          continue;
+        }
+        auto z =
+            *llvm::find_if(operands, [&](auto v) { return v != x && v != y; });
+
+        size_t fusionIndex = statements.size();
+        for (size_t j = i + 1; j < statements.size(); j++) {
+          const auto& s = statements[j];
+          if (s.kind == Statement::Kind::Update && s.op == Statement::Op::Xor &&
+              s.target == y && s.operands.size() == 2 &&
+              llvm::is_contained(s.operands, x) &&
+              llvm::is_contained(s.operands, z)) {
+            fusionIndex = j;
+            break;
+          }
+        }
+        if (fusionIndex < statements.size()) {
+          for (size_t j = 0; j < i; j++) {
+            const auto& s = statements[j];
+            if (s.kind == Statement::Kind::Temp && !s.inPlace &&
+                llvm::is_contained(rollbackStatement(statements, j),
+                                   fusionIndex)) {
+              fusionIndex = statements.size();
+              break;
+            }
+          }
+        }
+
+        bool incompatible = false;
+        for (size_t j = i + 1; j < statements.size(); j++) {
+          if (j == fusionIndex) {
+            continue;
+          }
+          if (statements[j].target == x || statements[j].target == y ||
+              statements[j].target == z) {
+            incompatible = true;
+            break;
+          }
+          if (llvm::is_contained(statements[j].operands, x) ||
+              llvm::is_contained(statements[j].operands, y) ||
+              llvm::is_contained(statements[j].operands, z)) {
+            incompatible = true;
+            break;
+          }
+        }
+
+        if (incompatible) {
+          continue;
+        }
+
+        statements[i].target = x;
+        statements[i].operands = {y, z};
+        statements[i].inPlace = true;
+        statements[i].fused = fusionIndex < statements.size();
+        if (fusionIndex < statements.size()) {
+          statements[fusionIndex].fused = true;
+        }
+
+        for (size_t j = i + 1; j < statements.size(); j++) {
+          llvm::replace(statements[j].operands, target, x);
+        }
+
+        allocator.discard(target);
+        done = true;
+        break;
+      }
     }
   }
 }
@@ -364,8 +486,12 @@ void emitUpdateStep(const UpdateStep& step,
   }
 
   auto statements = buildStatements(step, storageMap, allocator);
+  makeGadgets(statements, allocator);
 
   for (const auto& statement : statements) {
+    if (statement.kind == Statement::Kind::Update && statement.fused) {
+      continue;
+    }
     emitStatement(statement, loc, rewriter);
   }
 
