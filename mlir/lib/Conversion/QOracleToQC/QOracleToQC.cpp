@@ -608,6 +608,17 @@ bool canRestore(SmallVector<UpdateStep> steps,
   return true;
 }
 
+bool canOverwrite(Operation* op, Value value,
+                  DenseMap<Value, Value>& containers) {
+  if (!containers.contains(value)) {
+    return false;
+  }
+  if (value.getParentBlock() != op->getBlock() || !isLastReader(op, value)) {
+    return false;
+  }
+  return true;
+}
+
 std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
                                            DenseMap<Value, Value>& containers,
                                            bool allowBorrowing) {
@@ -621,14 +632,10 @@ std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
       break;
     }
     for (auto [i, value] : llvm::enumerate(op->getOperands())) {
-      if (!containers.contains(value)) {
-        continue;
-      }
       if (oracleOp.isKeptAlias(containers[value]) != kept) {
         continue;
       }
-      if (value.getParentBlock() != op->getBlock() ||
-          !isLastReader(op, value)) {
+      if (!canOverwrite(op, value, containers)) {
         continue;
       }
       overwriteIndex = i;
