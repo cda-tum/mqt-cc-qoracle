@@ -320,6 +320,28 @@ protected:
     }
   }
 
+  /// Lower `body` and return the number of helper qubits the circuit
+  /// allocates.
+  [[nodiscard]] size_t countHelpers(StringRef body) {
+    auto moduleOp = parseBody(body);
+    if (!moduleOp) {
+      ADD_FAILURE() << diagnostics;
+      return 0;
+    }
+    const auto before = countAllocations(*moduleOp);
+    if (!runPass(*moduleOp)) {
+      ADD_FAILURE() << diagnostics;
+      return 0;
+    }
+    return countAllocations(*moduleOp) - before;
+  }
+
+  [[nodiscard]] static size_t countAllocations(ModuleOp moduleOp) {
+    size_t allocations = 0;
+    moduleOp.walk([&](qc::AllocOp) { ++allocations; });
+    return allocations;
+  }
+
   /// Expect that the pass rejects `body` with `message` and leaves the IR
   /// unchanged.
   void expectRejected(StringRef body, StringRef message,
@@ -544,13 +566,7 @@ TEST_F(QOracleToQCTest, AddsWithOneHelper) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1] + in[0]};
   });
-
-  auto moduleOp = parseBody(body);
-  ASSERT_TRUE(moduleOp) << diagnostics;
-  ASSERT_TRUE(runPass(*moduleOp)) << diagnostics;
-  size_t helpers = 0;
-  moduleOp->walk([&](qc::AllocOp) { ++helpers; });
-  EXPECT_EQ(helpers, 1U) << print(*moduleOp);
+  EXPECT_EQ(countHelpers(body), 1U);
 }
 
 TEST_F(QOracleToQCTest, AddsIntoRightOperand) {
@@ -807,6 +823,139 @@ TEST_F(QOracleToQCTest, RejectsCapturedMeasurementResult) {
       qoracle.yield %next : i1
     })mlir",
                  "captures a classical value that is not a constant");
+}
+
+// A kept register that is not read after a step may hold the step's result.
+// R6 restores it at the end of the oracle, so `a ^ b` needs no helpers.
+TEST_F(QOracleToQCTest, BorrowsKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.xori %va, %vb : i3
+      %next = arith.addi %vr, %ab : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] + (in[0] ^ in[1])};
+  });
+  // The addition needs its carry helper.
+  EXPECT_EQ(countHelpers(body), 1U);
+}
+
+// Restoring a register that holds a sum needs a subtraction.
+TEST_F(QOracleToQCTest, BorrowsKeptRegisterForAddition) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.addi %va, %vb : i3
+      %next = arith.xori %vr, %ab : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (in[0] + in[1])};
+  });
+  // The addition and its inverse each need one carry helper.
+  EXPECT_EQ(countHelpers(body), 2U);
+}
+
+// The second step reads the register that the first step borrows, so R6 must
+// restore `b` before `a`.
+TEST_F(QOracleToQCTest, RestoresBorrowedRegistersInReverseOrder) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %ab = arith.xori %va, %vb : i2
+      %bab = arith.xori %vb, %ab : i2
+      %next = arith.xori %vr, %bab : i2
+      qoracle.yield %next : i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ in[0]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+// Restoring `a` at the end would read `r ^ b` instead of `r`, so the pass
+// must not borrow `a`.
+TEST_F(QOracleToQCTest, KeepsRegisterWhenRestoreWouldReadChangedValue) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    %s = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%r : memref<2x!qc.qubit> as %vr,
+                            %s : memref<2x!qc.qubit> as %vs) {
+      %ar = arith.xori %va, %vr : i2
+      %nextS = arith.xori %vs, %ar : i2
+      %nextR = arith.xori %vr, %vb : i2
+      qoracle.yield %nextR, %nextS : i2, i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] ^ in[1], in[3] ^ in[0] ^ in[2]};
+                 });
+}
+
+// Borrowing `a` would overwrite it before the temporary `a & b` is
+// recomputed, so the pass lowers without borrowing and reports nothing.
+TEST_F(QOracleToQCTest, KeepsRegisterWhenTemporaryReadsItLater) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %c = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb,
+                        %c : memref<2x!qc.qubit> as %vc)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i2
+      %ac = arith.xori %va, %vc : i2
+      %r1 = arith.xori %vr, %ab : i2
+      %r2 = arith.xori %r1, %ac : i2
+      qoracle.yield %r2 : i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2],
+                           in[3] ^ (in[0] & in[1]) ^ (in[0] ^ in[2])};
+                 });
+  EXPECT_EQ(diagnostics, "");
+}
+
+// Inverting a loop is not supported, so a loop cannot borrow its initial
+// value. The rejection reports only the attempt without borrowing.
+TEST_F(QOracleToQCTest, RejectsLoopOverKeptRegister) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%acc = %va) -> (i2) {
+        %next = arith.xori %acc, %vr : i2
+        scf.yield %next : i2
+      }
+      %result = arith.xori %vr, %out : i2
+      qoracle.yield %result : i2
+    })mlir",
+                 "a loop initial value is not stored in consumed qubits");
+  EXPECT_EQ(StringRef(diagnostics).count("cannot lower qoracle"), 1U)
+      << diagnostics;
 }
 
 TEST_F(QOracleToQCTest, RepeatsLoopBody) {
