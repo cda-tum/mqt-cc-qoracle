@@ -98,6 +98,8 @@ def OracleOp : QOracleOp<"oracle", traits = [AttrSizedOperandSegments]> {
     ::mlir::Block::BlockArgListType getKeptAliases();
     ::mlir::Block::BlockArgListType getConsumedAliases();
     bool ownsValue(::mlir::Value value);
+    bool isKeptAlias(::mlir::Value value);
+    bool isConsumedAlias(::mlir::Value value);
   }];
 }
 

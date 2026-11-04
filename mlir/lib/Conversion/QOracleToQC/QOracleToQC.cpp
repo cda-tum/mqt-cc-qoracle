@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
@@ -61,6 +62,7 @@ struct UpdateStep {
   Operation* updateOp;
   Value overwriteValue;
   Value otherValue;
+  bool borrows = false;
   SmallVector<Operation*> temporaries;
   std::vector<UpdateStep> body;
 };
@@ -503,6 +505,27 @@ void emitUpdateStep(const UpdateStep& step,
   allocator.release(loopHelpers);
 }
 
+void emitInverseStep(const UpdateStep& step,
+                     DenseMap<Value, SmallVector<Value>>& storageMap,
+                     Location loc, PatternRewriter& rewriter) {
+  SmallVector<Value> loopHelpers;
+  if (isa<arith::XOrIOp>(step.updateOp)) {
+    emitUpdateStep(step, storageMap, loc, nullptr, loopHelpers, rewriter);
+    return;
+  }
+  if (isa<arith::AddIOp>(step.updateOp)) {
+    auto bitWidth =
+        step.updateOp->getResult(0).getType().getIntOrFloatBitWidth();
+    for (size_t i = 0; i < bitWidth; i++) {
+      emitGate(loc, {}, storageMap.at(step.overwriteValue)[i], rewriter);
+    }
+    emitUpdateStep(step, storageMap, loc, nullptr, loopHelpers, rewriter);
+    for (size_t i = 0; i < bitWidth; i++) {
+      emitGate(loc, {}, storageMap.at(step.overwriteValue)[i], rewriter);
+    }
+  }
+}
+
 SmallVector<Operation*>
 reachableTemporaries(Value source, DenseMap<Value, Value>& containers) {
   SmallVector<Operation*> temporaries;
@@ -544,22 +567,73 @@ bool isLastReader(Operation* op, Value value) {
   });
 }
 
-std::pair<Value, Value> operandToOverwrite(Operation* op,
-                                           DenseMap<Value, Value>& containers) {
+bool canRestore(SmallVector<UpdateStep> steps,
+                DenseMap<Value, Value>& containers) {
+  for (size_t i = 0; i < steps.size(); ++i) {
+    if (!steps[i].borrows) {
+      continue;
+    }
+    DenseSet<Value> reads;
+    if (containers.contains(steps[i].otherValue)) {
+      reads.insert(containers[steps[i].otherValue]);
+    }
+    for (auto* temporary : steps[i].temporaries) {
+      for (auto operand : temporary->getOperands()) {
+        if (!containers.contains(operand)) {
+          continue;
+        }
+        reads.insert(containers.at(operand));
+      }
+    }
+
+    for (size_t j = i + 1; j < steps.size(); ++j) {
+      if (steps[j].borrows) {
+        continue;
+      }
+      DenseSet<Value> writes;
+      if (auto forOp = dyn_cast<scf::ForOp>(steps[j].updateOp)) {
+        for (auto arg : forOp.getInitArgs()) {
+          writes.insert(containers.at(arg));
+        }
+      } else {
+        writes.insert(containers.at(steps[j].overwriteValue));
+      }
+
+      if (llvm::any_of(reads,
+                       [&](Value read) { return writes.contains(read); })) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
+                                           DenseMap<Value, Value>& containers,
+                                           bool allowBorrowing) {
   if (!isa<arith::XOrIOp, arith::AddIOp>(op)) {
     return {nullptr, nullptr};
   }
 
   size_t overwriteIndex = 2;
-  for (auto [i, value] : llvm::enumerate(op->getOperands())) {
-    if (!containers.contains(value)) {
-      continue;
+  for (bool kept : {false, true}) {
+    if (overwriteIndex < 2 || (kept && !allowBorrowing)) {
+      break;
     }
-    if (value.getParentBlock() != op->getBlock() || !isLastReader(op, value)) {
-      continue;
+    for (auto [i, value] : llvm::enumerate(op->getOperands())) {
+      if (!containers.contains(value)) {
+        continue;
+      }
+      if (oracleOp.isKeptAlias(containers[value]) != kept) {
+        continue;
+      }
+      if (value.getParentBlock() != op->getBlock() ||
+          !isLastReader(op, value)) {
+        continue;
+      }
+      overwriteIndex = i;
+      break;
     }
-    overwriteIndex = i;
-    break;
   }
   if (overwriteIndex > 1) {
     return {nullptr, nullptr};
@@ -573,8 +647,9 @@ std::pair<Value, Value> operandToOverwrite(Operation* op,
   return {toOverwrite, other};
 }
 
-FailureOr<SmallVector<UpdateStep>>
-planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers);
+FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
+                                             DenseMap<Value, Value>& containers,
+                                             bool allowBorrowing);
 
 FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
                                DenseMap<Value, Value>& containers) {
@@ -585,7 +660,7 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
   }
   for (auto [init, iterArg] :
        llvm::zip_equal(forOp.getInitArgs(), forOp.getRegionIterArgs())) {
-    if (!containers.contains(init)) {
+    if (!containers.contains(init) || oracle.isKeptAlias(containers[init])) {
       oracle.emitOpError(
           "cannot lower qoracle because a loop initial value is not stored in "
           "consumed qubits");
@@ -620,7 +695,8 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
     }
   }
 
-  auto body = planBlock(forOp.getBodyRegion().front(), oracle, containers);
+  auto body =
+      planBlock(forOp.getBodyRegion().front(), oracle, containers, false);
   if (failed(body)) {
     return failure();
   }
@@ -651,8 +727,9 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
   return step;
 }
 
-FailureOr<SmallVector<UpdateStep>>
-planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers) {
+FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
+                                             DenseMap<Value, Value>& containers,
+                                             bool allowBorrowing) {
   SmallVector<UpdateStep> updateSteps;
   for (auto& op : block.without_terminator()) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
@@ -664,7 +741,8 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers) {
       continue;
     }
 
-    auto [overwriteValue, other] = operandToOverwrite(&op, containers);
+    auto [overwriteValue, other] =
+        operandToOverwrite(&op, oracle, containers, allowBorrowing);
     auto temporaries = reachableTemporaries(other, containers);
     if (!overwriteValue) {
       continue;
@@ -679,7 +757,9 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers) {
       }
     }
 
-    updateSteps.emplace_back(&op, overwriteValue, other, temporaries);
+    updateSteps.emplace_back(&op, overwriteValue, other,
+                             oracle.isKeptAlias(containers[overwriteValue]),
+                             temporaries);
     containers[op.getResult(0)] = containers[overwriteValue];
   }
 
@@ -701,10 +781,14 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers) {
   return updateSteps;
 }
 
-FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
-  DenseMap<Value, Value> containers;
+FailureOr<SmallVector<UpdateStep>>
+planWith(OracleOp oracle, bool allowBorrowing,
+         DenseMap<Value, Value>& containers) {
   for (auto consumed : oracle.getConsumedAliases()) {
     containers[consumed] = consumed;
+  }
+  for (auto kept : oracle.getKeptAliases()) {
+    containers[kept] = kept;
   }
 
   llvm::SetVector<Value> captured;
@@ -717,7 +801,8 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
     }
   }
 
-  auto steps = planBlock(oracle.getRegion().front(), oracle, containers);
+  auto steps =
+      planBlock(oracle.getRegion().front(), oracle, containers, allowBorrowing);
   if (failed(steps)) {
     return failure();
   }
@@ -734,6 +819,20 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
   }
 
   return success(updateSteps);
+}
+
+FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
+  {
+    ScopedDiagnosticHandler silence(oracle.getContext(),
+                                    [](Diagnostic&) { return success(); });
+    DenseMap<Value, Value> containers;
+    auto steps = planWith(oracle, true, containers);
+    if (succeeded(steps) && canRestore(*steps, containers)) {
+      return steps;
+    }
+  }
+  DenseMap<Value, Value> containers;
+  return planWith(oracle, false, containers);
 }
 
 bool validRegion(Block* block) {
@@ -839,6 +938,13 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
 
   SmallVector<Value> helpers;
   emitSteps(op, updateSteps, nullptr, loc, storageMap, helpers, rewriter);
+
+  for (const auto& step : llvm::reverse(updateSteps)) {
+    if (!step.borrows) {
+      continue;
+    }
+    emitInverseStep(step, storageMap, loc, rewriter);
+  }
 }
 
 struct ConvertOracleOp final : OpConversionPattern<OracleOp> {

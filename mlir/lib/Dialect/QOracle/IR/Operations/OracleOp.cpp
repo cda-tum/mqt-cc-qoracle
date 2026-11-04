@@ -108,14 +108,22 @@ Block::BlockArgListType OracleOp::getConsumedAliases() {
 }
 
 bool OracleOp::ownsValue(Value value) {
-  if (llvm::find(getConsumedAliases(), value) != getConsumedAliases().end()) {
+  if (isConsumedAlias(value)) {
     return true;
   }
-  if (llvm::find(getKeptAliases(), value) != getKeptAliases().end()) {
+  if (isKeptAlias(value)) {
     return false;
   }
   if (getRegion().isAncestor(value.getParentRegion())) {
     return true;
   }
   return false;
+}
+
+bool OracleOp::isKeptAlias(Value value) {
+  return llvm::is_contained(getKeptAliases(), value);
+}
+
+bool OracleOp::isConsumedAlias(Value value) {
+  return llvm::is_contained(getConsumedAliases(), value);
 }
