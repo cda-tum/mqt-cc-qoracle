@@ -65,30 +65,44 @@ struct UpdateStep {
   std::vector<UpdateStep> body;
 };
 
-struct Bit {
-  Value word;
-  size_t index;
-};
-
 struct Statement {
   enum class Kind { Temp, Update };
-  enum class Op { Xor, And };
+  enum class Op { Xor, And, Maj };
 
   Kind kind;
   Op op;
-  Bit target;
-  SmallVector<Bit> operands;
+  Value target;
+  SmallVector<Value> operands;
   bool invert = false;
 };
 
-Value allocateHelper(Operation* outerLoop, Location loc,
-                     PatternRewriter& rewriter) {
-  OpBuilder::InsertionGuard guard(rewriter);
-  if (outerLoop != nullptr) {
-    rewriter.setInsertionPoint(outerLoop);
+struct HelperAllocator {
+  Operation* outerLoop;
+  Location loc;
+  PatternRewriter& rewriter;
+  SmallVector<Value> allocated;
+
+  Value allocate() {
+    OpBuilder::InsertionGuard guard(rewriter);
+    if (outerLoop != nullptr) {
+      rewriter.setInsertionPoint(outerLoop);
+    }
+    auto qubit = qc::AllocOp::create(rewriter, loc);
+
+    allocated.push_back(qubit);
+    return qubit;
   }
-  return qc::AllocOp::create(rewriter, loc);
-}
+
+  void release(SmallVector<Value>& container) {
+    if (outerLoop != nullptr) {
+      llvm::append_range(container, allocated);
+    } else {
+      for (auto qubit : allocated) {
+        qc::DeallocOp::create(rewriter, loc, qubit);
+      }
+    }
+  }
+};
 
 void emitGate(Location loc, ArrayRef<Value> controls, Value target,
               PatternRewriter& rewriter) {
@@ -101,44 +115,76 @@ void emitGate(Location loc, ArrayRef<Value> controls, Value target,
   }
 }
 
-SmallVector<Statement> createAdditionStatements(Value target, Value other,
-                                                Statement::Kind kind) {
+SmallVector<Statement>
+createAdditionStatements(Value target, Value other, Statement::Kind kind,
+                         DenseMap<Value, SmallVector<Value>>& storageMap,
+                         HelperAllocator& allocator) {
+  auto result = storageMap.at(target);
+  auto otherValue = storageMap.at(other);
+  SmallVector<Value> carries;
   SmallVector<Statement> statements;
+
   auto bitWidth = target.getType().getIntOrFloatBitWidth();
-  for (size_t i = 0; i < bitWidth; ++i) {
-    for (size_t j = bitWidth - 1; j > i; j--) {
-      SmallVector<Bit> args;
-      for (size_t k = i; k < j; ++k) {
-        args.push_back({.word = target, .index = k});
-      }
-      args.push_back({.word = other, .index = i});
-      statements.push_back({.kind = kind,
-                            .op = Statement::Op::And,
-                            .target = {.word = target, .index = j},
-                            .operands = args});
-    }
-    statements.push_back({.kind = kind,
-                          .op = Statement::Op::Xor,
-                          .target = {.word = target, .index = i},
-                          .operands = {{.word = other, .index = i}}});
+  for (size_t i = 0; i < bitWidth - 1; i++) {
+    carries.push_back(allocator.allocate());
   }
+
+  for (size_t i = 0; i < bitWidth; i++) {
+    if (i + 1 < bitWidth) {
+      if (i == 0) {
+        statements.push_back({.kind = Statement::Kind::Temp,
+                              .op = Statement::Op::And,
+                              .target = carries[i],
+                              .operands = {result[i], otherValue[i]}});
+      } else {
+        statements.push_back(
+            {.kind = Statement::Kind::Temp,
+             .op = Statement::Op::Maj,
+             .target = carries[i],
+             .operands = {result[i], otherValue[i], carries[i - 1]}});
+      }
+    }
+
+    if (i == 0) {
+      statements.push_back({
+          .kind = kind,
+          .op = Statement::Op::Xor,
+          .target = result[i],
+          .operands = {otherValue[i]},
+      });
+    } else {
+      statements.push_back({
+          .kind = kind,
+          .op = Statement::Op::Xor,
+          .target = result[i],
+          .operands = {otherValue[i], carries[i - 1]},
+      });
+    }
+  }
+
   return statements;
 }
 
-SmallVector<Statement> buildStatements(const UpdateStep& update) {
+SmallVector<Statement>
+buildStatements(const UpdateStep& update,
+                DenseMap<Value, SmallVector<Value>>& storageMap,
+                HelperAllocator& allocator) {
   SmallVector<Statement> statements;
   for (const auto& temporary : update.temporaries) {
+    auto result = storageMap.at(temporary->getResult(0));
+
     if (isa<arith::XOrIOp, arith::AndIOp>(temporary)) {
+      auto lhs = storageMap.at(temporary->getOperand(0));
+      auto rhs = storageMap.at(temporary->getOperand(1));
+
       auto operation = isa<arith::XOrIOp>(temporary) ? Statement::Op::Xor
                                                      : Statement::Op::And;
       auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
       for (size_t i = 0; i < bitWidth; ++i) {
-        statements.push_back(
-            {.kind = Statement::Kind::Temp,
-             .op = operation,
-             .target = {.word = temporary->getResult(0), .index = i},
-             .operands = {{.word = temporary->getOperand(0), .index = i},
-                          {.word = temporary->getOperand(1), .index = i}}});
+        statements.push_back({.kind = Statement::Kind::Temp,
+                              .op = operation,
+                              .target = result[i],
+                              .operands = {lhs[i], rhs[i]}});
       }
     } else if (auto constOp = dyn_cast<arith::ConstantOp>(temporary)) {
       auto constantValue = cast<IntegerAttr>(constOp.getValue()).getValue();
@@ -147,25 +193,24 @@ SmallVector<Statement> buildStatements(const UpdateStep& update) {
         if (!constantValue[i]) {
           continue;
         }
-        statements.push_back(
-            {.kind = Statement::Kind::Temp,
-             .op = Statement::Op::Xor,
-             .target = {.word = temporary->getResult(0), .index = i},
-             .operands = {},
-             .invert = true});
+        statements.push_back({.kind = Statement::Kind::Temp,
+                              .op = Statement::Op::Xor,
+                              .target = result[i],
+                              .operands = {},
+                              .invert = true});
       }
     } else if (auto addiOp = dyn_cast<arith::AddIOp>(temporary)) {
+      auto lhs = storageMap.at(temporary->getOperand(0));
       auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
       for (size_t i = 0; i < bitWidth; ++i) {
-        statements.push_back(
-            {.kind = Statement::Kind::Temp,
-             .op = Statement::Op::Xor,
-             .target = {.word = temporary->getResult(0), .index = i},
-             .operands = {{.word = temporary->getOperand(0), .index = i}}});
+        statements.push_back({.kind = Statement::Kind::Temp,
+                              .op = Statement::Op::Xor,
+                              .target = result[i],
+                              .operands = {lhs[i]}});
       }
       auto additionStatements = createAdditionStatements(
           temporary->getResult(0), temporary->getOperand(1),
-          Statement::Kind::Temp);
+          Statement::Kind::Temp, storageMap, allocator);
       statements.append(additionStatements.begin(), additionStatements.end());
     } else if (!isa<arith::ExtUIOp, arith::TruncIOp>(temporary)) {
       llvm_unreachable("Unexpected temporary operation");
@@ -176,15 +221,15 @@ SmallVector<Statement> buildStatements(const UpdateStep& update) {
     auto bitWidth =
         update.updateOp->getResult(0).getType().getIntOrFloatBitWidth();
     for (size_t i = 0; i < bitWidth; ++i) {
-      statements.push_back(
-          {.kind = Statement::Kind::Update,
-           .op = Statement::Op::Xor,
-           .target = {.word = update.overwriteValue, .index = i},
-           .operands = {{.word = update.otherValue, .index = i}}});
+      statements.push_back({.kind = Statement::Kind::Update,
+                            .op = Statement::Op::Xor,
+                            .target = storageMap.at(update.overwriteValue)[i],
+                            .operands = {storageMap.at(update.otherValue)[i]}});
     }
   } else if (isa<arith::AddIOp>(update.updateOp)) {
     auto additionStatements = createAdditionStatements(
-        update.overwriteValue, update.otherValue, Statement::Kind::Update);
+        update.overwriteValue, update.otherValue, Statement::Kind::Update,
+        storageMap, allocator);
     statements.append(additionStatements.begin(), additionStatements.end());
   } else {
     llvm_unreachable("Unexpected update operation");
@@ -192,22 +237,89 @@ SmallVector<Statement> buildStatements(const UpdateStep& update) {
   return statements;
 }
 
-void emitStatement(const Statement& statement,
-                   DenseMap<Value, SmallVector<Value>>& storageMap,
-                   Location loc, PatternRewriter& rewriter) {
-  auto target = storageMap.at(statement.target.word)[statement.target.index];
-  auto controls = SmallVector<Value>();
-  for (const auto& operand : statement.operands) {
-    controls.push_back(storageMap.at(operand.word)[operand.index]);
-  }
+void emitStatement(const Statement& statement, Location loc,
+                   PatternRewriter& rewriter) {
+  auto target = statement.target;
   if (statement.op == Statement::Op::And) {
-    emitGate(loc, controls, target, rewriter);
+    emitGate(loc, statement.operands, target, rewriter);
   } else if (statement.op == Statement::Op::Xor) {
-    for (const auto& control : controls) {
+    for (auto control : statement.operands) {
       emitGate(loc, {control}, target, rewriter);
     }
     if (statement.invert) {
       emitGate(loc, {}, target, rewriter);
+    }
+  } else if (statement.op == Statement::Op::Maj) {
+    assert(statement.operands.size() == 3 &&
+           "maj takes exactly three operands");
+    auto x = statement.operands[0];
+    auto y = statement.operands[1];
+    auto z = statement.operands[2];
+    emitGate(loc, {z}, x, rewriter);
+    emitGate(loc, {z}, y, rewriter);
+    emitGate(loc, {x, y}, statement.target, rewriter);
+    emitGate(loc, {z}, statement.target, rewriter);
+    emitGate(loc, {z}, y, rewriter);
+    emitGate(loc, {z}, x, rewriter);
+  }
+}
+
+SmallVector<size_t> rollbackStatement(ArrayRef<Statement> statements,
+                                      size_t index) {
+  DenseSet<Value> neededValues(llvm::from_range, statements[index].operands);
+  BitVector picked(statements.size());
+  bool found = true;
+
+  while (found) {
+    found = false;
+    for (size_t i = index + 1; i < statements.size(); ++i) {
+      const auto& u = statements[i];
+      if (u.kind == Statement::Kind::Temp) {
+        continue;
+      }
+      if (picked[i]) {
+        continue;
+      }
+
+      if (neededValues.contains(u.target)) {
+        picked[i] = true;
+        found = true;
+        for (auto operand : u.operands) {
+          neededValues.insert(operand);
+        }
+      }
+    }
+  }
+
+  SmallVector<size_t> pickedStatements;
+  for (auto i : picked.set_bits()) {
+    pickedStatements.push_back(i);
+  }
+  return pickedStatements;
+}
+
+void temporaryCleanup(ArrayRef<Statement> statements, Location loc,
+                      PatternRewriter& rewriter) {
+  for (size_t i = statements.size(); i-- > 0;) {
+    const auto& statement = statements[i];
+    if (statement.kind != Statement::Kind::Temp) {
+      continue;
+    }
+    auto toRollBack = rollbackStatement(statements, i);
+    for (auto j : llvm::reverse(toRollBack)) {
+      emitStatement(statements[j], loc, rewriter);
+    }
+    emitStatement(statement, loc, rewriter);
+    for (auto j : toRollBack) {
+      assert(llvm::none_of(statements.drop_front(i + 1),
+                           [&](const Statement& t) {
+                             return t.kind == Statement::Kind::Temp &&
+                                    llvm::is_contained(statements[j].operands,
+                                                       t.target);
+                           }) &&
+             "rollback reads an already cleaned temporary");
+
+      emitStatement(statements[j], loc, rewriter);
     }
   }
 }
@@ -217,7 +329,7 @@ void emitUpdateStep(const UpdateStep& step,
                     Location loc, Operation* outerLoop,
                     SmallVector<Value>& loopHelpers,
                     PatternRewriter& rewriter) {
-  SmallVector<Value> allocated;
+  HelperAllocator allocator{outerLoop, loc, rewriter};
 
   for (auto* temporary : step.temporaries) {
     SmallVector<Value> helpers;
@@ -229,9 +341,8 @@ void emitUpdateStep(const UpdateStep& step,
         helpers.push_back(storageMap.at(operand)[i]);
       }
       for (size_t i = oldWidth; i < bitWidth; ++i) {
-        auto qubit = allocateHelper(outerLoop, loc, rewriter);
+        auto qubit = allocator.allocate();
         helpers.push_back(qubit);
-        allocated.push_back(qubit);
       }
       storageMap[extuiOp.getResult()] = std::move(helpers);
       continue;
@@ -246,35 +357,24 @@ void emitUpdateStep(const UpdateStep& step,
     }
 
     for (size_t i = 0; i < bitWidth; ++i) {
-      auto qubit = allocateHelper(outerLoop, loc, rewriter);
+      auto qubit = allocator.allocate();
       helpers.push_back(qubit);
-      allocated.push_back(qubit);
     }
     storageMap[temporary->getResult(0)] = std::move(helpers);
   }
 
-  auto statements = buildStatements(step);
+  auto statements = buildStatements(step, storageMap, allocator);
 
   for (const auto& statement : statements) {
-    emitStatement(statement, storageMap, loc, rewriter);
+    emitStatement(statement, loc, rewriter);
   }
 
-  for (const auto& statement : llvm::reverse(statements)) {
-    if (statement.kind == Statement::Kind::Temp) {
-      emitStatement(statement, storageMap, loc, rewriter);
-    }
-  }
+  temporaryCleanup(statements, loc, rewriter);
 
   auto qubits = storageMap.at(step.overwriteValue);
   storageMap[step.updateOp->getResult(0)] = qubits;
 
-  if (outerLoop != nullptr) {
-    llvm::append_range(loopHelpers, allocated);
-  } else {
-    for (auto qubit : allocated) {
-      qc::DeallocOp::create(rewriter, loc, qubit);
-    }
-  }
+  allocator.release(loopHelpers);
 }
 
 SmallVector<Operation*>
