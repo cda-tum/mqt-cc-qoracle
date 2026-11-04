@@ -113,6 +113,76 @@ struct HelperAllocator {
   }
 };
 
+struct Rotation {
+  Value source;
+  int64_t amount;
+};
+
+SmallVector<Value> rotateList(ArrayRef<Value> list, int64_t amount) {
+  SmallVector<Value> result(list.size());
+  size_t n = list.size();
+  for (size_t i = 0; i < list.size(); ++i) {
+    result[i] = list[(i - amount + n) % n];
+  }
+  return result;
+}
+
+void sortBits(ArrayRef<Value> current, ArrayRef<Value> desired, Location loc,
+              PatternRewriter& rewriter) {
+  SmallVector<Value> currentList(current.begin(), current.end());
+  size_t n = currentList.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (currentList[i] == desired[i]) {
+      continue;
+    }
+    auto* it = llvm::find(currentList, desired[i]);
+    qc::SWAPOp::create(rewriter, loc, currentList[i], *it);
+    *it = currentList[i];
+    currentList[i] = desired[i];
+  }
+}
+
+FailureOr<Rotation> matchRotation(Operation* op) {
+  auto ori = dyn_cast<arith::OrIOp>(op);
+  if (!ori) {
+    return failure();
+  }
+  auto bitWidth = ori.getType().getIntOrFloatBitWidth();
+  auto lhs = ori.getLhs();
+  auto rhs = ori.getRhs();
+  for (auto [hi, lo] : {std::pair{lhs, rhs}, std::pair{rhs, lhs}}) {
+    auto shl = hi.getDefiningOp<arith::ShLIOp>();
+    auto shr = lo.getDefiningOp<arith::ShRUIOp>();
+    if (!shl || !shr) {
+      continue;
+    }
+    if (shl.getLhs() != shr.getLhs()) {
+      return failure();
+    }
+    auto k = getConstantIntValue(shl.getRhs());
+    auto m = getConstantIntValue(shr.getRhs());
+    if (!k || !m) {
+      return failure();
+    }
+    if (*k <= 0 || *k >= bitWidth || *k + *m != bitWidth) {
+      return failure();
+    }
+    if (!shl->hasOneUse() || !shr->hasOneUse()) {
+      return failure();
+    }
+    return Rotation{.source = shl.getLhs(), .amount = *k};
+  }
+  return failure();
+}
+
+SmallVector<Value> getTemporaryInputs(Operation* op) {
+  auto result = matchRotation(op);
+  if (succeeded(result)) {
+    return {result->source};
+  }
+  return llvm::to_vector(op->getOperands());
+}
+
 void emitGate(Location loc, ArrayRef<Value> controls, Value target,
               PatternRewriter& rewriter) {
   if (!controls.empty()) {
@@ -221,7 +291,7 @@ buildStatements(const UpdateStep& update,
           temporary->getResult(0), temporary->getOperand(1),
           Statement::Kind::Temp, storageMap, allocator);
       statements.append(additionStatements.begin(), additionStatements.end());
-    } else if (!isa<arith::ExtUIOp, arith::TruncIOp>(temporary)) {
+    } else if (!isa<arith::ExtUIOp, arith::TruncIOp, arith::OrIOp>(temporary)) {
       llvm_unreachable("Unexpected temporary operation");
     }
   }
@@ -453,9 +523,24 @@ void emitUpdateStep(const UpdateStep& step,
                     Location loc, Operation* outerLoop,
                     SmallVector<Value>& loopHelpers,
                     PatternRewriter& rewriter) {
-  HelperAllocator allocator{outerLoop, loc, rewriter};
+  auto rotation = matchRotation(step.updateOp);
+  if (succeeded(rotation)) {
+    storageMap[step.updateOp->getResult(0)] =
+        rotateList(storageMap.at(rotation->source), rotation->amount);
+    return;
+  }
+
+  HelperAllocator allocator{
+      .outerLoop = outerLoop, .loc = loc, .rewriter = rewriter};
 
   for (auto* temporary : step.temporaries) {
+    auto temporaryRotation = matchRotation(temporary);
+    if (succeeded(temporaryRotation)) {
+      storageMap[temporary->getResult(0)] = rotateList(
+          storageMap.at(temporaryRotation->source), temporaryRotation->amount);
+      continue;
+    }
+
     SmallVector<Value> helpers;
     auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
     if (auto extuiOp = dyn_cast<arith::ExtUIOp>(temporary)) {
@@ -551,7 +636,7 @@ reachableTemporaries(Value source, DenseMap<Value, Value>& containers) {
 
     // first visit, continue with operands and then revisit in post-order.
     toVisit.emplace_back(current, true);
-    for (auto operand : llvm::reverse(defOp->getOperands())) {
+    for (auto operand : llvm::reverse(getTemporaryInputs(defOp))) {
       toVisit.emplace_back(operand, false);
     }
   }
@@ -574,11 +659,11 @@ bool canRestore(SmallVector<UpdateStep> steps,
       continue;
     }
     DenseSet<Value> reads;
-    if (containers.contains(steps[i].otherValue)) {
+    if (steps[i].otherValue && containers.contains(steps[i].otherValue)) {
       reads.insert(containers[steps[i].otherValue]);
     }
     for (auto* temporary : steps[i].temporaries) {
-      for (auto operand : temporary->getOperands()) {
+      for (auto operand : getTemporaryInputs(temporary)) {
         if (!containers.contains(operand)) {
           continue;
         }
@@ -747,6 +832,20 @@ FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
       updateSteps.push_back(std::move(*step));
       continue;
     }
+    auto rotation = matchRotation(&op);
+    if (succeeded(rotation)) {
+      auto source = rotation->source;
+      if (canOverwrite(&op, source, containers) &&
+          (allowBorrowing || !oracle.isKeptAlias(containers[source]))) {
+        updateSteps.emplace_back(
+            UpdateStep{.updateOp = &op,
+                       .overwriteValue = source,
+                       .otherValue = nullptr,
+                       .borrows = oracle.isKeptAlias(containers[source])});
+        containers[op.getResult(0)] = containers[source];
+      }
+      continue;
+    }
 
     auto [overwriteValue, other] =
         operandToOverwrite(&op, oracle, containers, allowBorrowing);
@@ -756,7 +855,7 @@ FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
     }
 
     for (auto* tempOp : temporaries) {
-      if (llvm::is_contained(tempOp->getOperands(), overwriteValue)) {
+      if (llvm::is_contained(getTemporaryInputs(tempOp), overwriteValue)) {
         oracle.emitOpError(
             "cannot lower qoracle because a temporary depends on "
             "the value to be overwritten");
@@ -773,7 +872,7 @@ FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
   DenseSet<Value> overwritten;
   for (auto& step : updateSteps) {
     for (auto* tempOp : step.temporaries) {
-      for (auto operand : tempOp->getOperands()) {
+      for (auto operand : getTemporaryInputs(tempOp)) {
         if (overwritten.contains(operand)) {
           oracle.emitOpError(
               "cannot lower qoracle because a temporary depends on a value "
@@ -845,6 +944,15 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
 bool validRegion(Block* block) {
   if (block
           ->walk([&](Operation* op) {
+            if (isa<arith::OrIOp>(op) && succeeded(matchRotation(op))) {
+              // OrIOps are allowed to represent a rotation.
+              return WalkResult::advance();
+            }
+            if (isa<arith::ShLIOp, arith::ShRUIOp>(op) && op->hasOneUse() &&
+                succeeded(matchRotation(*op->getUsers().begin()))) {
+              // Shifts used inside a rotation are allowed.
+              return WalkResult::advance();
+            }
             if (!isa<arith::ConstantOp, arith::XOrIOp, arith::AndIOp,
                      arith::AddIOp, arith::ExtUIOp, arith::TruncIOp,
                      qoracle::YieldOp, scf::ForOp, scf::YieldOp>(op)) {
@@ -890,6 +998,12 @@ void emitForLoop(OracleOp op, scf::ForOp forOp, Operation* outerLoop,
   rewriter.setInsertionPoint(newForOp.getBody()->getTerminator());
   emitSteps(op, step.body, !outerLoop ? newForOp : outerLoop, loc, storageMap,
             loopHelpers, rewriter);
+  for (auto [iterArg, yieldArg] :
+       llvm::zip_equal(forOp.getRegionIterArgs(),
+                       forOp.getBody()->getTerminator()->getOperands())) {
+    sortBits(storageMap.at(yieldArg), storageMap.at(iterArg), loc, rewriter);
+  }
+
   rewriter.setInsertionPointAfter(newForOp);
 
   for (auto [init, result] :
@@ -951,6 +1065,13 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
       continue;
     }
     emitInverseStep(step, storageMap, loc, rewriter);
+  }
+
+  for (auto [consumedArg, yieldArg] :
+       llvm::zip_equal(op.getConsumedAliases(),
+                       op.getRegion().front().getTerminator()->getOperands())) {
+    sortBits(storageMap.at(yieldArg), storageMap.at(consumedArg), loc,
+             rewriter);
   }
 }
 

@@ -130,6 +130,10 @@ LogicalResult BasisSimulator::apply(Operation& op) {
     if (failed(first) || failed(second)) {
       return failure();
     }
+    if (*first == *second) {
+      ADD_FAILURE() << "SWAP of a qubit with itself";
+      return failure();
+    }
     const bool value = bits_[*first];
     bits_[*first] = bits_[*second];
     bits_[*second] = value;
@@ -1012,6 +1016,24 @@ TEST_F(QOracleToQCTest, RecognizesRotationWithSwappedOperands) {
     })mlir",
       [](ArrayRef<uint64_t> in) -> RegisterValues {
         return {rotl(in[0], 3, 4)};
+      });
+}
+
+// A rotation by half the width splits into two cycles of qubits, as ChaCha's
+// rotation by 16 does on 32 bits.
+TEST_F(QOracleToQCTest, RotatesByHalfTheWidth) {
+  expectLowersTo(
+      R"mlir(
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c2 = arith.constant 2 : i4
+      %hi = arith.shli %vd, %c2 : i4
+      %lo = arith.shrui %vd, %c2 : i4
+      %rot = arith.ori %hi, %lo : i4
+      qoracle.yield %rot : i4
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues {
+        return {rotl(in[0], 2, 4)};
       });
 }
 
