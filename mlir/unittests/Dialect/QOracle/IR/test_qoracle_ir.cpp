@@ -175,6 +175,56 @@ TEST_F(QOracleIRTest, RoundTripsEveryOperandGroupCombination) {
   }
 }
 
+TEST_F(QOracleIRTest, RoundTripsZeroMarker) {
+  auto moduleOp = parseBody(R"mlir(
+    %a = qc.alloc : !qc.qubit
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    %q = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : !qc.qubit as %va)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            zero %r : memref<2x!qc.qubit> as %vr,
+                            zero %q : !qc.qubit as %vq) {
+      qoracle.yield %vx, %vr, %vq : i2, i2, i1
+    })mlir");
+  ASSERT_TRUE(moduleOp) << diagnostics;
+  auto oracle = findOracle(*moduleOp);
+  ASSERT_TRUE(oracle);
+
+  auto consumed = oracle.getConsumedAliases();
+  EXPECT_FALSE(oracle.isZeroAlias(oracle.getKeptAliases()[0]));
+  EXPECT_FALSE(oracle.isZeroAlias(consumed[0]));
+  EXPECT_TRUE(oracle.isZeroAlias(consumed[1]));
+  EXPECT_TRUE(oracle.isZeroAlias(consumed[2]));
+
+  // The marker is printed inline, not as an attribute after the region.
+  const auto printed = print(*moduleOp);
+  EXPECT_EQ(printed.find("consumed_zeros"), std::string::npos) << printed;
+  size_t markers = 0;
+  for (auto pos = printed.find("zero %"); pos != std::string::npos;
+       pos = printed.find("zero %", pos + 1)) {
+    ++markers;
+  }
+  EXPECT_EQ(markers, 2U) << printed;
+
+  auto reparsed = parseSourceString<ModuleOp>(printed, context.get());
+  ASSERT_TRUE(reparsed) << printed << diagnostics;
+  EXPECT_EQ(print(*reparsed), printed);
+}
+
+TEST_F(QOracleIRTest, OmitsZeroAttributeWithoutMarkers) {
+  auto moduleOp = parseBody(R"mlir(
+    %q = qc.alloc : !qc.qubit
+    qoracle.oracle consumed(%q : !qc.qubit as %vq) {
+      qoracle.yield %vq : i1
+    })mlir");
+  ASSERT_TRUE(moduleOp) << diagnostics;
+  auto oracle = findOracle(*moduleOp);
+  ASSERT_TRUE(oracle);
+  EXPECT_FALSE(oracle.getConsumedZerosAttr());
+  EXPECT_FALSE(oracle.isZeroAlias(oracle.getConsumedAliases()[0]));
+}
+
 TEST_F(QOracleIRTest, AliasesFollowOperandOrder) {
   auto moduleOp = parseBody(R"mlir(
     %a = qc.alloc : !qc.qubit
@@ -303,6 +353,28 @@ TEST_F(QOracleIRTest, RejectsBlockArgumentMismatch) {
     }) : (!qc.qubit) -> ())mlir",
                  "type of block argument 0 ('i2') does not match the expected "
                  "alias type ('i1')");
+}
+
+TEST_F(QOracleIRTest, RejectsZeroMarkerOnKeptOperand) {
+  expectRejected(R"mlir(
+    %q = qc.alloc : !qc.qubit
+    qoracle.oracle kept(zero %q : !qc.qubit as %vq) {
+      qoracle.yield
+    })mlir",
+                 "expected SSA operand");
+}
+
+// The custom parser creates one flag per consumed operand, so a wrong count is
+// only reachable through the generic form or C++ builders.
+TEST_F(QOracleIRTest, RejectsZeroFlagCountMismatch) {
+  expectRejected(R"mlir(
+    %q = qc.alloc : !qc.qubit
+    "qoracle.oracle"(%q) <{consumed_zeros = array<i1: true, false>,
+                           operandSegmentSizes = array<i32: 0, 1>}> ({
+    ^bb0(%c: i1):
+      qoracle.yield %c : i1
+    }) : (!qc.qubit) -> ())mlir",
+                 "must have one zero flag per consumed operand");
 }
 
 TEST_F(QOracleIRTest, RejectsDuplicateOperands) {

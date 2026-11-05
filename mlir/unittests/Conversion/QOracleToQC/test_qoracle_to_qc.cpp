@@ -16,6 +16,7 @@
 #include "mqt/Dialect/QC/IR/QCDialect.h"
 #include "mqt/Dialect/QC/IR/QCOps.h"
 #include "mqt/Dialect/QOracle/IR/QOracleDialect.h"
+#include "mqt/Dialect/QOracle/IR/QOracleOps.h"
 
 #include "gtest/gtest.h"
 
@@ -289,9 +290,10 @@ protected:
   /// Lower `body` and check that, on every basis state, the circuit maps the
   /// initial register values to `expected(initial)`.
   ///
-  /// The registers are the allocations in `body`, in program order. The
-  /// check also requires the output to follow the MQT allocation rules and
-  /// every helper qubit to be 0 when it is deallocated.
+  /// The registers are the allocations in `body`, in program order. Registers
+  /// passed to an oracle as `zero` operands start at 0 only. The check also
+  /// requires the output to follow the MQT allocation rules and every helper
+  /// qubit to be 0 when it is deallocated.
   void expectLowersTo(
       StringRef body,
       llvm::function_ref<RegisterValues(ArrayRef<uint64_t>)> expected) {
@@ -316,6 +318,18 @@ protected:
     }
     ASSERT_LE(totalBits, MAX_INPUT_BITS);
 
+    SmallVector<bool> startsAtZero(inputs.size(), false);
+    for (auto oracle : function.getOps<qoracle::OracleOp>()) {
+      for (auto [qubits, alias] : llvm::zip_equal(
+               oracle.getConsumedQubits(), oracle.getConsumedAliases())) {
+        const auto* input = llvm::find(inputs, qubits.getDefiningOp());
+        ASSERT_NE(input, inputs.end());
+        if (oracle.isZeroAlias(alias)) {
+          startsAtZero[input - inputs.begin()] = true;
+        }
+      }
+    }
+
     ASSERT_TRUE(runPass(*moduleOp)) << diagnostics;
     ASSERT_TRUE(succeeded(verify(*moduleOp))) << diagnostics;
     const auto lowered = print(*moduleOp);
@@ -329,6 +343,12 @@ protected:
       for (auto width : widths) {
         initial.push_back((code >> offset) & ((uint64_t{1} << width) - 1));
         offset += width;
+      }
+      if (llvm::any_of(llvm::zip_equal(initial, startsAtZero), [](auto entry) {
+            auto [value, zero] = entry;
+            return zero && value != 0;
+          })) {
+        continue;
       }
       for (auto [value, width] : llvm::zip_equal(expected(initial), widths)) {
         want.push_back(value & ((uint64_t{1} << width) - 1));
@@ -1370,6 +1390,222 @@ TEST_F(QOracleToQCTest, RejectsShiftReadOutsideRotation) {
       qoracle.yield %r2 : i4
     })mlir",
                  "contains invalid operations");
+}
+
+// A `zero` register starts at 0, so a value whose operands must all be kept is
+// computed into it: a copy of `a`, then an in-place addition of `b`.
+TEST_F(QOracleToQCTest, CreatesSumInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      %s = arith.addi %va, %vb : i3
+      qoracle.yield %s : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[0] + in[1]};
+  });
+  EXPECT_EQ(countHelpers(body), 1U);
+}
+
+TEST_F(QOracleToQCTest, CreatesXorInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      %s = arith.xori %va, %vb : i3
+      qoracle.yield %s : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[0] ^ in[1]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+TEST_F(QOracleToQCTest, CreatesAndInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      %s = arith.andi %va, %vb : i3
+      qoracle.yield %s : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[0] & in[1]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+TEST_F(QOracleToQCTest, CreatesConstantInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      %five = arith.constant 5 : i3
+      qoracle.yield %five : i3
+    })mlir";
+  expectLowersTo(body,
+                 [](ArrayRef<uint64_t>) -> RegisterValues { return {5U}; });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+TEST_F(QOracleToQCTest, CopiesKeptRegisterIntoZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      qoracle.yield %va : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[0]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+// Inside the region, the alias of a `zero` register is 0, so an update of it
+// is an ordinary in-place update.
+TEST_F(QOracleToQCTest, UpdatesZeroAlias) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i3
+      %next = arith.xori %vr, %ab : i3
+      qoracle.yield %next : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[0] & in[1]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, UpdatesCreatedValueInPlace) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      %s = arith.addi %va, %vb : i3
+      %t = arith.xori %s, %vc : i3
+      %u = arith.addi %t, %va : i3
+      qoracle.yield %u : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2],
+                           ((in[0] + in[1]) ^ in[2]) + in[0]};
+                 });
+}
+
+// Once created, `%s` lives in `r`, so the later update of `x` reads it from
+// there instead of recomputing it.
+TEST_F(QOracleToQCTest, ReadsCreatedValueInLaterUpdate) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            zero %r : memref<2x!qc.qubit> as %vr) {
+      %s = arith.andi %va, %vb : i2
+      %next = arith.xori %vx, %s : i2
+      qoracle.yield %next, %s : i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (in[0] & in[1]), in[0] & in[1]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+// `%s` reads `x` before `%next` overwrites it, so `%s` must be created first.
+TEST_F(QOracleToQCTest, CreatesValueBeforeItsOperandIsOverwritten) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %x = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(%x : memref<3x!qc.qubit> as %vx,
+                            zero %r : memref<3x!qc.qubit> as %vr) {
+      %s = arith.addi %vx, %va : i3
+      %next = arith.xori %vx, %va : i3
+      qoracle.yield %next, %s : i3, i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ in[0], in[1] + in[0]};
+                 });
+}
+
+TEST_F(QOracleToQCTest, CreatesValuesInSeveralZeroRegisters) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    %t = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(zero %r : memref<2x!qc.qubit> as %vr,
+                            zero %t : memref<2x!qc.qubit> as %vt) {
+      %sum = arith.addi %va, %vb : i2
+      %xor = arith.xori %va, %vb : i2
+      qoracle.yield %sum, %xor : i2, i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[0] + in[1], in[0] ^ in[1]};
+                 });
+}
+
+// The pattern of ChaCha with a kept state: create a sum, then rotate it.
+TEST_F(QOracleToQCTest, RotatesCreatedValue) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(zero %r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %s = arith.addi %va, %vb : i4
+      %hi = arith.shli %s, %c1 : i4
+      %lo = arith.shrui %s, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      qoracle.yield %rot : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], rotl(in[0] + in[1], 1, 4)};
+  });
+  EXPECT_EQ(countHelpers(body), 1U);
+}
+
+// Without the marker, the register holds an unknown value.
+TEST_F(QOracleToQCTest, RejectsCreationInRegisterWithoutZeroMarker) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %s = arith.addi %va, %vb : i3
+      qoracle.yield %s : i3
+    })mlir",
+                 "yielded value 0 does not match");
 }
 
 TEST_F(QOracleToQCTest, RepeatsLoopBody) {
