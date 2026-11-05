@@ -44,6 +44,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -378,6 +379,23 @@ protected:
     return countAllocations(*moduleOp) - before;
   }
 
+  /// Lower `body` and return the number of Toffoli gates in the circuit, with
+  /// each loop body counted once.
+  [[nodiscard]] size_t countToffolis(StringRef body) {
+    auto moduleOp = parseBody(body);
+    if (!moduleOp || !runPass(*moduleOp)) {
+      ADD_FAILURE() << diagnostics;
+      return 0;
+    }
+    size_t toffolis = 0;
+    moduleOp->walk([&](qc::CtrlOp ctrl) {
+      if (ctrl.getNumControls() == 2) {
+        ++toffolis;
+      }
+    });
+    return toffolis;
+  }
+
   [[nodiscard]] static size_t countAllocations(ModuleOp moduleOp) {
     size_t allocations = 0;
     moduleOp.walk([&](qc::AllocOp) { ++allocations; });
@@ -668,6 +686,150 @@ TEST_F(QOracleToQCTest, AddsConstant) {
       qoracle.yield %next : i4
     })mlir",
       [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[0] + 11U}; });
+}
+
+// The constant's bits are known, so no qubits hold them and each carry is a
+// function of two qubits. Below the lowest 1-bit at index `low`, every carry is
+// 0; the carry into bit `low + 1` is a copy. Each later carry into bits up to
+// w - 1 costs one Toffoli to compute and one to clean up, so a w-bit addition
+// takes 2 * max(0, w - 2 - low) Toffolis and at most w - 1 - low helpers.
+TEST_F(QOracleToQCTest, AddsConstantWithoutConstantQubits) {
+  struct ConstantCase {
+    uint64_t value;
+    size_t toffolis;
+    size_t maxHelpers;
+  };
+  const std::array<ConstantCase, 6> cases = {{
+      {.value = 1, .toffolis = 8, .maxHelpers = 5},
+      {.value = 4, .toffolis = 4, .maxHelpers = 3},
+      {.value = 45, .toffolis = 8, .maxHelpers = 5}, // 0b101101
+      {.value = 63, .toffolis = 8, .maxHelpers = 5}, // all ones: r - 1
+      {.value = 48, .toffolis = 0, .maxHelpers = 1}, // 0b110000
+      {.value = 32, .toffolis = 0, .maxHelpers = 0}, // only the top bit
+  }};
+  for (const auto& testCase : cases) {
+    SCOPED_TRACE(testCase.value);
+    const auto body = R"mlir(
+    %r = memref.alloc() : memref<6x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<6x!qc.qubit> as %vr) {
+      %c = arith.constant )mlir" +
+                      std::to_string(testCase.value) + R"mlir( : i6
+      %next = arith.addi %vr, %c : i6
+      qoracle.yield %next : i6
+    })mlir";
+    expectLowersTo(body, [&](ArrayRef<uint64_t> in) -> RegisterValues {
+      return {in[0] + testCase.value};
+    });
+    EXPECT_EQ(countToffolis(body), testCase.toffolis);
+    EXPECT_LE(countHelpers(body), testCase.maxHelpers);
+  }
+}
+
+TEST_F(QOracleToQCTest, AddsConstantFromLeft) {
+  constexpr StringRef body = R"mlir(
+    %r = memref.alloc() : memref<6x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<6x!qc.qubit> as %vr) {
+      %c = arith.constant 4 : i6
+      %next = arith.addi %c, %vr : i6
+      qoracle.yield %next : i6
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0] + 4U};
+  });
+  EXPECT_EQ(countToffolis(body), 4U);
+}
+
+TEST_F(QOracleToQCTest, AddsZeroWithoutGates) {
+  constexpr StringRef body = R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %zero = arith.constant 0 : i4
+      %next = arith.addi %vr, %zero : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(
+      body, [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[0]}; });
+  auto moduleOp = parseBody(body);
+  ASSERT_TRUE(moduleOp) << diagnostics;
+  ASSERT_TRUE(runPass(*moduleOp)) << diagnostics;
+  size_t gates = 0;
+  moduleOp->walk([&](Operation* op) {
+    if (isa<qc::XOp, qc::CtrlOp, qc::SWAPOp, qc::AllocOp>(op)) {
+      ++gates;
+    }
+  });
+  EXPECT_EQ(gates, 0U) << print(*moduleOp);
+}
+
+// ChaCha's key setting starts each of words 0 to 3 as `constant + key`.
+TEST_F(QOracleToQCTest, CreatesSumOfConstantAndKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %k = memref.alloc() : memref<5x!qc.qubit>
+    %r = memref.alloc() : memref<5x!qc.qubit>
+    qoracle.oracle kept(%k : memref<5x!qc.qubit> as %vk)
+                   consumed(zero %r : memref<5x!qc.qubit> as %vr) {
+      %c = arith.constant 6 : i5
+      %s = arith.addi %c, %vk : i5
+      qoracle.yield %s : i5
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[0] + 6U};
+  });
+  EXPECT_EQ(countToffolis(body), 4U);
+  EXPECT_LE(countHelpers(body), 3U);
+}
+
+// One constant read by two additions, as in ChaCha's feed-forward.
+TEST_F(QOracleToQCTest, AddsSharedConstantIntoTwoRegisters) {
+  constexpr StringRef body = R"mlir(
+    %x = memref.alloc() : memref<4x!qc.qubit>
+    %y = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%x : memref<4x!qc.qubit> as %vx,
+                            %y : memref<4x!qc.qubit> as %vy) {
+      %c = arith.constant 5 : i4
+      %nx = arith.addi %vx, %c : i4
+      %ny = arith.addi %vy, %c : i4
+      qoracle.yield %nx, %ny : i4, i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0] + 5U, in[1] + 5U};
+  });
+  EXPECT_EQ(countToffolis(body), 8U);
+}
+
+TEST_F(QOracleToQCTest, XorsSumWithConstantIntoRegister) {
+  expectLowersTo(R"mlir(
+    %k = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%k : memref<4x!qc.qubit> as %vk)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c = arith.constant 3 : i4
+      %s = arith.addi %vk, %c : i4
+      %next = arith.xori %vr, %s : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ (in[0] + 3U)};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AddsConstantInsideLoop) {
+  expectLowersTo(R"mlir(
+    %r = memref.alloc() : memref<5x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<5x!qc.qubit> as %vr) {
+      %lb = arith.constant 0 : index
+      %ub = arith.constant 3 : index
+      %step = arith.constant 1 : index
+      %c = arith.constant 7 : i5
+      %out = scf.for %i = %lb to %ub step %step iter_args(%acc = %vr) -> (i5) {
+        %next = arith.addi %acc, %c : i5
+        scf.yield %next : i5
+      }
+      qoracle.yield %out : i5
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0] + (3U * 7U)};
+                 });
 }
 
 TEST_F(QOracleToQCTest, IncrementsByControlQubit) {
