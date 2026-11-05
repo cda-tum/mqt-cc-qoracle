@@ -72,7 +72,7 @@ struct UpdateStep {
 
 struct Statement {
   enum class Kind { Temp, Update };
-  enum class Op { Xor, And, Maj };
+  enum class Op { Xor, And, Maj, Or };
 
   Kind kind;
   Op op;
@@ -197,6 +197,46 @@ void emitGate(Location loc, ArrayRef<Value> controls, Value target,
   }
 }
 
+SmallVector<Statement> createConstantAdditionStatements(
+    Value target, APInt constant, Statement::Kind kind,
+    DenseMap<Value, SmallVector<Value>>& storageMap,
+    HelperAllocator& allocator) {
+  auto result = storageMap.at(target);
+  auto bitWidth = constant.getBitWidth();
+  SmallVector<Statement> statements;
+  Value carry = nullptr;
+  for (size_t i = 0; i < bitWidth; ++i) {
+    Value next;
+    if (i + 1 < bitWidth) {
+      if (carry == nullptr && constant[i]) {
+        next = allocator.allocate();
+        statements.push_back(Statement{.kind = Statement::Kind::Temp,
+                                       .op = Statement::Op::Xor,
+                                       .target = next,
+                                       .operands = {result[i]}});
+      } else if (carry != nullptr) {
+        next = allocator.allocate();
+        statements.push_back(Statement{.kind = Statement::Kind::Temp,
+                                       .op = constant[i] ? Statement::Op::Or
+                                                         : Statement::Op::And,
+                                       .target = next,
+                                       .operands = {result[i], carry}});
+      }
+    }
+    if (carry != nullptr || constant[i]) {
+      statements.push_back(Statement{
+          .kind = kind,
+          .op = Statement::Op::Xor,
+          .target = result[i],
+          .operands = carry ? SmallVector<Value>{carry} : SmallVector<Value>{},
+          .invert = constant[i],
+      });
+    }
+    carry = next;
+  }
+  return statements;
+}
+
 SmallVector<Statement>
 createAdditionStatements(Value target, Value other, Statement::Kind kind,
                          DenseMap<Value, SmallVector<Value>>& storageMap,
@@ -247,13 +287,48 @@ createAdditionStatements(Value target, Value other, Statement::Kind kind,
   return statements;
 }
 
+FailureOr<APInt> constantBits(Value value) {
+  APInt bits;
+  if (matchPattern(value, m_ConstantInt(&bits))) {
+    return bits;
+  }
+  return failure();
+}
+
+bool isFolded(Operation* user, Value operand) {
+  if (!operand || !isa<arith::XOrIOp, arith::AddIOp>(user)) {
+    return false;
+  }
+  auto lhs = user->getOperand(0);
+  auto rhs = user->getOperand(1);
+  auto other = lhs == operand ? rhs : lhs;
+  return matchPattern(operand, m_Constant()) &&
+         !matchPattern(other, m_Constant());
+}
+
 void computeInto(Operation* op, Statement::Kind kind,
                  DenseMap<Value, SmallVector<Value>>& storageMap,
                  HelperAllocator& allocator,
                  SmallVector<Statement>& statements) {
   auto result = storageMap.at(op->getResult(0));
 
-  if (isa<arith::XOrIOp, arith::AndIOp>(op)) {
+  if (isa<arith::XOrIOp>(op) &&
+      (isFolded(op, op->getOperand(0)) || isFolded(op, op->getOperand(1)))) {
+    Value folded =
+        isFolded(op, op->getOperand(0)) ? op->getOperand(0) : op->getOperand(1);
+    auto constant = *constantBits(folded);
+    auto other =
+        folded == op->getOperand(0) ? op->getOperand(1) : op->getOperand(0);
+    auto otherBits = storageMap.at(other);
+    auto bitWidth = constant.getBitWidth();
+    for (size_t i = 0; i < bitWidth; ++i) {
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::Xor,
+                            .target = result[i],
+                            .operands = {otherBits[i]},
+                            .invert = constant[i]});
+    }
+  } else if (isa<arith::XOrIOp, arith::AndIOp>(op)) {
     auto lhs = storageMap.at(op->getOperand(0));
     auto rhs = storageMap.at(op->getOperand(1));
 
@@ -280,17 +355,27 @@ void computeInto(Operation* op, Statement::Kind kind,
                             .invert = true});
     }
   } else if (auto addiOp = dyn_cast<arith::AddIOp>(op)) {
-    auto lhs = storageMap.at(op->getOperand(0));
+    auto folded = isFolded(op, op->getOperand(0))   ? op->getOperand(0)
+                  : isFolded(op, op->getOperand(1)) ? op->getOperand(1)
+                                                    : nullptr;
+    auto other =
+        folded == op->getOperand(0) ? op->getOperand(1) : op->getOperand(0);
     auto bitWidth = op->getResult(0).getType().getIntOrFloatBitWidth();
     for (size_t i = 0; i < bitWidth; ++i) {
       statements.push_back({.kind = kind,
                             .op = Statement::Op::Xor,
                             .target = result[i],
-                            .operands = {lhs[i]}});
+                            .operands = {storageMap.at(other)[i]}});
     }
-    auto additionStatements = createAdditionStatements(
-        op->getResult(0), op->getOperand(1), kind, storageMap, allocator);
-    statements.append(additionStatements.begin(), additionStatements.end());
+    if (folded) {
+      auto constant = *constantBits(folded);
+      statements.append(createConstantAdditionStatements(
+          op->getResult(0), constant, kind, storageMap, allocator));
+    } else {
+      auto additionStatements = createAdditionStatements(
+          op->getResult(0), op->getOperand(1), kind, storageMap, allocator);
+      statements.append(additionStatements.begin(), additionStatements.end());
+    }
   } else if (auto rotation = matchRotation(op); succeeded(rotation)) {
     auto source = rotateList(storageMap.at(rotation->source), rotation->amount);
     auto bitWidth = source.size();
@@ -327,17 +412,39 @@ buildStatements(const UpdateStep& update,
   } else if (isa<arith::XOrIOp>(update.updateOp)) {
     auto bitWidth =
         update.updateOp->getResult(0).getType().getIntOrFloatBitWidth();
-    for (size_t i = 0; i < bitWidth; ++i) {
-      statements.push_back({.kind = Statement::Kind::Update,
-                            .op = Statement::Op::Xor,
-                            .target = storageMap.at(update.overwriteValue)[i],
-                            .operands = {storageMap.at(update.otherValue)[i]}});
+    auto constant = constantBits(update.otherValue);
+    if (succeeded(constant)) {
+      for (size_t i = 0; i < bitWidth; ++i) {
+        if (!(*constant)[i]) {
+          continue;
+        }
+        statements.push_back({.kind = Statement::Kind::Update,
+                              .op = Statement::Op::Xor,
+                              .target = storageMap.at(update.overwriteValue)[i],
+                              .operands = {},
+                              .invert = true});
+      }
+    } else {
+      for (size_t i = 0; i < bitWidth; ++i) {
+        statements.push_back(
+            {.kind = Statement::Kind::Update,
+             .op = Statement::Op::Xor,
+             .target = storageMap.at(update.overwriteValue)[i],
+             .operands = {storageMap.at(update.otherValue)[i]}});
+      }
     }
   } else if (isa<arith::AddIOp>(update.updateOp)) {
-    auto additionStatements = createAdditionStatements(
-        update.overwriteValue, update.otherValue, Statement::Kind::Update,
-        storageMap, allocator);
-    statements.append(additionStatements.begin(), additionStatements.end());
+    auto constant = constantBits(update.otherValue);
+    if (succeeded(constant)) {
+      statements.append(createConstantAdditionStatements(
+          update.overwriteValue, *constant, Statement::Kind::Update, storageMap,
+          allocator));
+    } else {
+      auto additionStatements = createAdditionStatements(
+          update.overwriteValue, update.otherValue, Statement::Kind::Update,
+          storageMap, allocator);
+      statements.append(additionStatements.begin(), additionStatements.end());
+    }
   } else {
     llvm_unreachable("Unexpected update operation");
   }
@@ -375,6 +482,12 @@ void emitStatement(const Statement& statement, Location loc,
     emitGate(loc, {z}, statement.target, rewriter);
     emitGate(loc, {z}, y, rewriter);
     emitGate(loc, {z}, x, rewriter);
+  } else if (statement.op == Statement::Op::Or) {
+    auto x = statement.operands[0];
+    auto y = statement.operands[1];
+    emitGate(loc, {x, y}, statement.target, rewriter);
+    emitGate(loc, {x}, statement.target, rewriter);
+    emitGate(loc, {y}, statement.target, rewriter);
   }
 }
 
@@ -674,6 +787,9 @@ reachableTemporaries(Value source, DenseMap<Value, Value>& containers) {
     // first visit, continue with operands and then revisit in post-order.
     toVisit.emplace_back(current, true);
     for (auto operand : llvm::reverse(getTemporaryInputs(defOp))) {
+      if (isFolded(defOp, operand)) {
+        continue;
+      }
       toVisit.emplace_back(operand, false);
     }
   }
@@ -876,6 +992,9 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
     if (auto zero = creations.lookup(&op)) {
       SetVector<Operation*> allReachableTemporaries;
       for (auto input : getTemporaryInputs(&op)) {
+        if (isFolded(&op, input)) {
+          continue;
+        }
         allReachableTemporaries.insert_range(
             reachableTemporaries(input, containers));
       }
@@ -911,7 +1030,9 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
 
     auto [overwriteValue, other] =
         operandToOverwrite(&op, oracle, containers, allowBorrowing);
-    auto temporaries = reachableTemporaries(other, containers);
+    auto temporaries = isFolded(&op, other)
+                           ? SmallVector<Operation*>{}
+                           : reachableTemporaries(other, containers);
     if (!overwriteValue) {
       continue;
     }
@@ -956,7 +1077,8 @@ Value chainInput(Operation* op, OracleOp oracle) {
   }
   for (auto input : getTemporaryInputs(op)) {
     if (input.getParentBlock() == op->getBlock() &&
-        !oracle.isKeptAlias(input) && isLastReader(op, input)) {
+        !oracle.isKeptAlias(input) && !isFolded(op, input) &&
+        isLastReader(op, input)) {
       return input;
     }
   }
