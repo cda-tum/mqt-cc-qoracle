@@ -59,12 +59,15 @@ using namespace qc;
 namespace {
 
 struct UpdateStep {
+  enum class Kind { Update, Create, Copy };
+
   Operation* updateOp;
   Value overwriteValue;
   Value otherValue;
   bool borrows = false;
   SmallVector<Operation*> temporaries;
   std::vector<UpdateStep> body;
+  Kind kind = Kind::Update;
 };
 
 struct Statement {
@@ -244,59 +247,84 @@ createAdditionStatements(Value target, Value other, Statement::Kind kind,
   return statements;
 }
 
+void computeInto(Operation* op, Statement::Kind kind,
+                 DenseMap<Value, SmallVector<Value>>& storageMap,
+                 HelperAllocator& allocator,
+                 SmallVector<Statement>& statements) {
+  auto result = storageMap.at(op->getResult(0));
+
+  if (isa<arith::XOrIOp, arith::AndIOp>(op)) {
+    auto lhs = storageMap.at(op->getOperand(0));
+    auto rhs = storageMap.at(op->getOperand(1));
+
+    auto operation =
+        isa<arith::XOrIOp>(op) ? Statement::Op::Xor : Statement::Op::And;
+    auto bitWidth = op->getResult(0).getType().getIntOrFloatBitWidth();
+    for (size_t i = 0; i < bitWidth; ++i) {
+      statements.push_back({.kind = kind,
+                            .op = operation,
+                            .target = result[i],
+                            .operands = {lhs[i], rhs[i]}});
+    }
+  } else if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
+    auto constantValue = cast<IntegerAttr>(constOp.getValue()).getValue();
+    auto bitWidth = constOp.getType().getIntOrFloatBitWidth();
+    for (size_t i = 0; i < bitWidth; ++i) {
+      if (!constantValue[i]) {
+        continue;
+      }
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::Xor,
+                            .target = result[i],
+                            .operands = {},
+                            .invert = true});
+    }
+  } else if (auto addiOp = dyn_cast<arith::AddIOp>(op)) {
+    auto lhs = storageMap.at(op->getOperand(0));
+    auto bitWidth = op->getResult(0).getType().getIntOrFloatBitWidth();
+    for (size_t i = 0; i < bitWidth; ++i) {
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::Xor,
+                            .target = result[i],
+                            .operands = {lhs[i]}});
+    }
+    auto additionStatements = createAdditionStatements(
+        op->getResult(0), op->getOperand(1), kind, storageMap, allocator);
+    statements.append(additionStatements.begin(), additionStatements.end());
+  } else if (auto rotation = matchRotation(op); succeeded(rotation)) {
+    auto source = rotateList(storageMap.at(rotation->source), rotation->amount);
+    auto bitWidth = source.size();
+    for (size_t i = 0; i < bitWidth; ++i) {
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::Xor,
+                            .target = result[i],
+                            .operands = {source[i]}});
+    }
+  } else {
+    llvm_unreachable("Unexpected temporary operation");
+  }
+}
+
 SmallVector<Statement>
 buildStatements(const UpdateStep& update,
                 DenseMap<Value, SmallVector<Value>>& storageMap,
                 HelperAllocator& allocator) {
   SmallVector<Statement> statements;
   for (const auto& temporary : update.temporaries) {
-    auto result = storageMap.at(temporary->getResult(0));
-
-    if (isa<arith::XOrIOp, arith::AndIOp>(temporary)) {
-      auto lhs = storageMap.at(temporary->getOperand(0));
-      auto rhs = storageMap.at(temporary->getOperand(1));
-
-      auto operation = isa<arith::XOrIOp>(temporary) ? Statement::Op::Xor
-                                                     : Statement::Op::And;
-      auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
-      for (size_t i = 0; i < bitWidth; ++i) {
-        statements.push_back({.kind = Statement::Kind::Temp,
-                              .op = operation,
-                              .target = result[i],
-                              .operands = {lhs[i], rhs[i]}});
-      }
-    } else if (auto constOp = dyn_cast<arith::ConstantOp>(temporary)) {
-      auto constantValue = cast<IntegerAttr>(constOp.getValue()).getValue();
-      auto bitWidth = constOp.getType().getIntOrFloatBitWidth();
-      for (size_t i = 0; i < bitWidth; ++i) {
-        if (!constantValue[i]) {
-          continue;
-        }
-        statements.push_back({.kind = Statement::Kind::Temp,
-                              .op = Statement::Op::Xor,
-                              .target = result[i],
-                              .operands = {},
-                              .invert = true});
-      }
-    } else if (auto addiOp = dyn_cast<arith::AddIOp>(temporary)) {
-      auto lhs = storageMap.at(temporary->getOperand(0));
-      auto bitWidth = temporary->getResult(0).getType().getIntOrFloatBitWidth();
-      for (size_t i = 0; i < bitWidth; ++i) {
-        statements.push_back({.kind = Statement::Kind::Temp,
-                              .op = Statement::Op::Xor,
-                              .target = result[i],
-                              .operands = {lhs[i]}});
-      }
-      auto additionStatements = createAdditionStatements(
-          temporary->getResult(0), temporary->getOperand(1),
-          Statement::Kind::Temp, storageMap, allocator);
-      statements.append(additionStatements.begin(), additionStatements.end());
-    } else if (!isa<arith::ExtUIOp, arith::TruncIOp, arith::OrIOp>(temporary)) {
-      llvm_unreachable("Unexpected temporary operation");
+    if (isa<arith::ExtUIOp, arith::TruncIOp>(temporary) ||
+        succeeded(matchRotation(temporary))) {
+      continue;
     }
+    computeInto(temporary, Statement::Kind::Temp, storageMap, allocator,
+                statements);
   }
 
-  if (isa<arith::XOrIOp>(update.updateOp)) {
+  if (update.kind == UpdateStep::Kind::Create) {
+    auto entry = storageMap.at(update.overwriteValue);
+    storageMap[update.updateOp->getResult(0)] = entry;
+    computeInto(update.updateOp, Statement::Kind::Update, storageMap, allocator,
+                statements);
+  } else if (isa<arith::XOrIOp>(update.updateOp)) {
     auto bitWidth =
         update.updateOp->getResult(0).getType().getIntOrFloatBitWidth();
     for (size_t i = 0; i < bitWidth; ++i) {
@@ -523,8 +551,17 @@ void emitUpdateStep(const UpdateStep& step,
                     Location loc, Operation* outerLoop,
                     SmallVector<Value>& loopHelpers,
                     PatternRewriter& rewriter) {
+  if (step.kind == UpdateStep::Kind::Copy) {
+    auto source = storageMap.at(step.otherValue);
+    auto target = storageMap.at(step.overwriteValue);
+    for (auto [s, t] : llvm::zip(source, target)) {
+      emitGate(loc, {s}, t, rewriter);
+    }
+    return;
+  }
+
   auto rotation = matchRotation(step.updateOp);
-  if (succeeded(rotation)) {
+  if (step.kind == UpdateStep::Kind::Update && succeeded(rotation)) {
     storageMap[step.updateOp->getResult(0)] =
         rotateList(storageMap.at(rotation->source), rotation->amount);
     return;
@@ -739,12 +776,13 @@ std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
   return {toOverwrite, other};
 }
 
-FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
-                                             DenseMap<Value, Value>& containers,
-                                             bool allowBorrowing);
+FailureOr<SmallVector<UpdateStep>>
+planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
+          const DenseMap<Operation*, Value>& creations, bool allowBorrowing);
 
 FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
-                               DenseMap<Value, Value>& containers) {
+                               DenseMap<Value, Value>& containers,
+                               const DenseMap<Operation*, Value>& creations) {
   if (!forOp.getInductionVar().use_empty()) {
     oracle.emitOpError(
         "cannot lower qoracle because a loop uses its induction variable");
@@ -788,8 +826,8 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
     }
   }
 
-  auto body =
-      planBlock(forOp.getBodyRegion().front(), oracle, containers, false);
+  auto body = planBlock(forOp.getBodyRegion().front(), oracle, containers,
+                        creations, false);
   if (failed(body)) {
     return failure();
   }
@@ -821,19 +859,40 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
   return step;
 }
 
-FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
-                                             DenseMap<Value, Value>& containers,
-                                             bool allowBorrowing) {
+FailureOr<SmallVector<UpdateStep>>
+planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
+          const DenseMap<Operation*, Value>& creations, bool allowBorrowing) {
   SmallVector<UpdateStep> updateSteps;
   for (auto& op : block.without_terminator()) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      auto step = planLoop(forOp, oracle, containers);
+      auto step = planLoop(forOp, oracle, containers, creations);
       if (failed(step)) {
         return failure();
       }
       updateSteps.push_back(std::move(*step));
       continue;
     }
+
+    if (auto zero = creations.lookup(&op)) {
+      SetVector<Operation*> allReachableTemporaries;
+      for (auto input : getTemporaryInputs(&op)) {
+        allReachableTemporaries.insert_range(
+            reachableTemporaries(input, containers));
+      }
+      updateSteps.push_back(UpdateStep{
+          .updateOp = &op,
+          .overwriteValue = zero,
+          .otherValue = nullptr,
+          .borrows = false,
+          .temporaries = SmallVector<Operation*>(
+              allReachableTemporaries.begin(), allReachableTemporaries.end()),
+          .body = {},
+          .kind = UpdateStep::Kind::Create,
+      });
+      containers[op.getResult(0)] = zero;
+      continue;
+    }
+
     auto rotation = matchRotation(&op);
     if (succeeded(rotation)) {
       auto source = rotation->source;
@@ -891,6 +950,62 @@ FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
   return updateSteps;
 }
 
+Value chainInput(Operation* op, OracleOp oracle) {
+  if (!isa<arith::XOrIOp, arith::AddIOp>(op) && failed(matchRotation(op))) {
+    return nullptr;
+  }
+  for (auto input : getTemporaryInputs(op)) {
+    if (input.getParentBlock() == op->getBlock() &&
+        !oracle.isKeptAlias(input) && isLastReader(op, input)) {
+      return input;
+    }
+  }
+  return nullptr;
+}
+
+Value chainStart(Value value, OracleOp oracle) {
+  while (auto* op = value.getDefiningOp()) {
+    auto input = chainInput(op, oracle);
+    if (!input) {
+      break;
+    }
+    value = input;
+  }
+  return value;
+}
+
+FailureOr<DenseMap<Operation*, Value>> findCreations(OracleOp oracle) {
+  DenseMap<Operation*, Value> creations;
+  auto yield = oracle.getRegion().getBlocks().front().getTerminator();
+  for (auto [index, yielded] : llvm::enumerate(yield->getOperands())) {
+    auto consumed = oracle.getConsumedAliases()[index];
+    if (!oracle.isZeroAlias(consumed)) {
+      continue;
+    }
+    auto* op = chainStart(yielded, oracle).getDefiningOp();
+    if (!op || isa<scf::ForOp>(op)) {
+      continue;
+    }
+    if (creations.contains(op)) {
+      continue;
+    }
+    if (!consumed.use_empty()) {
+      oracle.emitOpError("cannot lower qoracle because a zero alias is read "
+                         "while a value is created in its register");
+      return failure();
+    }
+    if (!isa<arith::XOrIOp, arith::AddIOp, arith::AndIOp, arith::ConstantOp>(
+            op) &&
+        failed(matchRotation(op))) {
+      oracle.emitOpError("cannot lower qoracle because an unsupported "
+                         "operation result is created in a zero register");
+      return failure();
+    }
+    creations[op] = consumed;
+  }
+  return creations;
+}
+
 FailureOr<SmallVector<UpdateStep>>
 planWith(OracleOp oracle, bool allowBorrowing,
          DenseMap<Value, Value>& containers) {
@@ -911,8 +1026,12 @@ planWith(OracleOp oracle, bool allowBorrowing,
     }
   }
 
-  auto steps =
-      planBlock(oracle.getRegion().front(), oracle, containers, allowBorrowing);
+  auto creations = findCreations(oracle);
+  if (failed(creations)) {
+    return failure();
+  }
+  auto steps = planBlock(oracle.getRegion().front(), oracle, containers,
+                         *creations, allowBorrowing);
   if (failed(steps)) {
     return failure();
   }
@@ -921,11 +1040,27 @@ planWith(OracleOp oracle, bool allowBorrowing,
   qoracle::YieldOp yield =
       llvm::cast<qoracle::YieldOp>(oracle.getRegion().front().getTerminator());
   for (auto [i, operand] : llvm::enumerate(yield.getOperands())) {
-    if (containers[operand] != oracle.getConsumedAliases()[i]) {
-      oracle.emitOpError("cannot lower qoracle because the yielded value ")
-          << i << " does not match the corresponding consumed alias";
-      return failure();
+    auto reg = oracle.getConsumedAliases()[i];
+    if (containers.lookup(operand) == reg) {
+      continue;
     }
+    if (oracle.isZeroAlias(reg) && containers.contains(operand) &&
+        reg.use_empty() &&
+        !llvm::is_contained(llvm::make_second_range(*creations), reg)) {
+      updateSteps.push_back(UpdateStep{
+          .updateOp = yield,
+          .overwriteValue = reg,
+          .otherValue = operand,
+          .borrows = false,
+          .temporaries = {},
+          .body = {},
+          .kind = UpdateStep::Kind::Copy,
+      });
+      continue;
+    }
+    oracle.emitOpError("cannot lower qoracle because the yielded value ")
+        << i << " does not match the corresponding consumed alias";
+    return failure();
   }
 
   return success(updateSteps);
@@ -962,7 +1097,7 @@ bool validRegion(Block* block) {
                      qoracle::YieldOp, scf::ForOp, scf::YieldOp>(op)) {
               return WalkResult::interrupt();
             }
-            if (op->getNumOperands() == 2 &&
+            if (!isa<qoracle::YieldOp>(op) && op->getNumOperands() == 2 &&
                 op->getOperand(0) == op->getOperand(1)) {
               return WalkResult::interrupt();
             }
@@ -1063,8 +1198,12 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
 
   SmallVector<Value> helpers;
   emitSteps(op, updateSteps, nullptr, loc, storageMap, helpers, rewriter);
+  DenseSet<Value> copied;
 
   for (const auto& step : llvm::reverse(updateSteps)) {
+    if (step.kind == UpdateStep::Kind::Copy) {
+      copied.insert(step.overwriteValue);
+    }
     if (!step.borrows) {
       continue;
     }
@@ -1074,6 +1213,9 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
   for (auto [consumedArg, yieldArg] :
        llvm::zip_equal(op.getConsumedAliases(),
                        op.getRegion().front().getTerminator()->getOperands())) {
+    if (copied.contains(consumedArg)) {
+      continue;
+    }
     sortBits(storageMap.at(yieldArg), storageMap.at(consumedArg), loc,
              rewriter);
   }

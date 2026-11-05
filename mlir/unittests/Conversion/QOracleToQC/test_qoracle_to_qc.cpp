@@ -1570,6 +1570,64 @@ TEST_F(QOracleToQCTest, CreatesValuesInSeveralZeroRegisters) {
                  });
 }
 
+// `%s` is created in `r`; the second `zero` register receives a copy.
+TEST_F(QOracleToQCTest, CopiesValueIntoSecondZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    %t = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(zero %r : memref<2x!qc.qubit> as %vr,
+                            zero %t : memref<2x!qc.qubit> as %vt) {
+      %s = arith.addi %va, %vb : i2
+      qoracle.yield %s, %s : i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[0] + in[1], in[0] + in[1]};
+  });
+  EXPECT_EQ(countHelpers(body), 1U);
+}
+
+// The value of `x` stays in `x`; the `zero` register receives a copy.
+TEST_F(QOracleToQCTest, CopiesUpdatedRegisterIntoZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %x = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(%x : memref<3x!qc.qubit> as %vx,
+                            zero %r : memref<3x!qc.qubit> as %vr) {
+      %next = arith.addi %vx, %va : i3
+      qoracle.yield %next, %next : i3, i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] + in[0], in[1] + in[0]};
+  });
+  EXPECT_EQ(countHelpers(body), 1U);
+}
+
+// The copy follows the relabeling, so `t` holds the rotated bits in order.
+TEST_F(QOracleToQCTest, CopiesRotatedValueIntoZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %x = memref.alloc() : memref<4x!qc.qubit>
+    %t = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%x : memref<4x!qc.qubit> as %vx,
+                            zero %t : memref<4x!qc.qubit> as %vt) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %hi = arith.shli %vx, %c1 : i4
+      %lo = arith.shrui %vx, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      qoracle.yield %rot, %rot : i4, i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {rotl(in[0], 1, 4), rotl(in[0], 1, 4)};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
 // The pattern of ChaCha with a kept state: create a sum, then rotate it.
 TEST_F(QOracleToQCTest, RotatesCreatedValue) {
   constexpr StringRef body = R"mlir(
@@ -1606,6 +1664,38 @@ TEST_F(QOracleToQCTest, RejectsCreationInRegisterWithoutZeroMarker) {
       qoracle.yield %s : i3
     })mlir",
                  "yielded value 0 does not match");
+}
+
+// `%t` reads the 0 in `r` after `%s` is created there.
+TEST_F(QOracleToQCTest, RejectsReadOfZeroAliasThatReceivesCreatedValue) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            zero %r : memref<2x!qc.qubit> as %vr) {
+      %s = arith.addi %va, %vb : i2
+      %t = arith.andi %vr, %va : i2
+      %next = arith.xori %vx, %t : i2
+      qoracle.yield %next, %s : i2, i2
+    })mlir",
+                 "is read while a value is created in its register");
+}
+
+TEST_F(QOracleToQCTest, RejectsCreationOfUnsupportedOperation) {
+  expectRejected(
+      R"mlir(
+    %k = qc.alloc : !qc.qubit
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%k : !qc.qubit as %vk)
+                   consumed(zero %r : memref<3x!qc.qubit> as %vr) {
+      %e = arith.extui %vk : i1 to i3
+      qoracle.yield %e : i3
+    })mlir",
+      "an unsupported operation result is created in a zero register");
 }
 
 TEST_F(QOracleToQCTest, RepeatsLoopBody) {
