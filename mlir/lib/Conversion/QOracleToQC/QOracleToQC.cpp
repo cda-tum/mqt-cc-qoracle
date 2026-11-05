@@ -717,7 +717,7 @@ std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
       break;
     }
     for (auto [i, value] : llvm::enumerate(op->getOperands())) {
-      if (oracleOp.isKeptAlias(containers[value]) != kept) {
+      if (oracleOp.isKeptAlias(containers.lookup(value)) != kept) {
         continue;
       }
       if (!canOverwrite(op, value, containers)) {
@@ -764,7 +764,8 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
           "the loop");
       return failure();
     }
-    containers[iterArg] = containers[init];
+    auto container = containers.at(init);
+    containers[iterArg] = container;
   }
 
   llvm::SetVector<Value> captured;
@@ -805,7 +806,8 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
 
   for (auto [result, init] :
        llvm::zip_equal(forOp.getResults(), forOp.getInitArgs())) {
-    containers[result] = containers[init];
+    auto container = containers.at(init);
+    containers[result] = container;
   }
 
   UpdateStep step{
@@ -842,7 +844,8 @@ FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
                        .overwriteValue = source,
                        .otherValue = nullptr,
                        .borrows = oracle.isKeptAlias(containers[source])});
-        containers[op.getResult(0)] = containers[source];
+        auto container = containers.at(source);
+        containers[op.getResult(0)] = container;
       }
       continue;
     }
@@ -866,7 +869,8 @@ FailureOr<SmallVector<UpdateStep>> planBlock(Block& block, OracleOp oracle,
     updateSteps.emplace_back(&op, overwriteValue, other,
                              oracle.isKeptAlias(containers[overwriteValue]),
                              temporaries);
-    containers[op.getResult(0)] = containers[overwriteValue];
+    auto container = containers.at(overwriteValue);
+    containers[op.getResult(0)] = container;
   }
 
   DenseSet<Value> overwritten;

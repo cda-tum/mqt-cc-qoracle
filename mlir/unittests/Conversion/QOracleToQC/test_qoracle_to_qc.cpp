@@ -411,6 +411,25 @@ TEST_F(QOracleToQCTest, ComputesAndIntoHelpers) {
                  });
 }
 
+// The temporary comes first, so the register to overwrite is the second
+// operand.
+TEST_F(QOracleToQCTest, XorsTemporaryIntoRightOperand) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i2
+      %next = arith.xori %ab, %vr : i2
+      qoracle.yield %next : i2
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] ^ (in[0] & in[1])};
+                 });
+}
+
 TEST_F(QOracleToQCTest, ComputesNestedTemporaries) {
   expectLowersTo(R"mlir(
     %a = memref.alloc() : memref<2x!qc.qubit>
