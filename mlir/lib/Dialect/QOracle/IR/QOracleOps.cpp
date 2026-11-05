@@ -45,9 +45,13 @@ void QOracleDialect::initialize() {
 parseOracleAliasGroup(OpAsmParser& parser,
                       SmallVectorImpl<OpAsmParser::UnresolvedOperand>& operands,
                       SmallVectorImpl<Type>& types,
-                      SmallVectorImpl<OpAsmParser::Argument>& aliases) {
+                      SmallVectorImpl<OpAsmParser::Argument>& aliases,
+                      SmallVectorImpl<bool>* zeros) {
   return parser.parseCommaSeparatedList(
       OpAsmParser::Delimiter::Paren, [&]() -> ParseResult {
+        if (zeros != nullptr) {
+          zeros->push_back(succeeded(parser.parseOptionalKeyword("zero")));
+        }
         OpAsmParser::UnresolvedOperand operand;
         if (failed(parser.parseOperand(operand)) ||
             failed(parser.parseColon())) {
@@ -80,19 +84,25 @@ parseOracleAliasGroup(OpAsmParser& parser,
     SmallVectorImpl<OpAsmParser::UnresolvedOperand>& keptQubits,
     SmallVectorImpl<Type>& keptTypes,
     SmallVectorImpl<OpAsmParser::UnresolvedOperand>& consumedQubits,
-    SmallVectorImpl<Type>& consumedTypes, Region& body) {
+    SmallVectorImpl<Type>& consumedTypes, DenseBoolArrayAttr& consumedZeros,
+    Region& body) {
   SmallVector<OpAsmParser::Argument> aliases;
+  SmallVector<bool> zeros;
 
   if (succeeded(parser.parseOptionalKeyword("kept"))) {
-    if (failed(parseOracleAliasGroup(parser, keptQubits, keptTypes, aliases))) {
+    if (failed(parseOracleAliasGroup(parser, keptQubits, keptTypes, aliases,
+                                     nullptr))) {
       return failure();
     }
   }
   if (succeeded(parser.parseOptionalKeyword("consumed"))) {
     if (failed(parseOracleAliasGroup(parser, consumedQubits, consumedTypes,
-                                     aliases))) {
+                                     aliases, &zeros))) {
       return failure();
     }
+  }
+  if (llvm::is_contained(zeros, true)) {
+    consumedZeros = parser.getBuilder().getDenseBoolArrayAttr(zeros);
   }
   return parser.parseRegion(body, aliases, /*enableNameShadowing=*/false);
 }
@@ -100,29 +110,39 @@ parseOracleAliasGroup(OpAsmParser& parser,
 /// Print one `kept(...)` or `consumed(...)` group, or nothing if it is empty.
 static void printOracleAliasGroup(OpAsmPrinter& printer, StringRef keyword,
                                   OperandRange operands, TypeRange types,
-                                  Block::BlockArgListType aliases) {
+                                  Block::BlockArgListType aliases,
+                                  ArrayRef<bool> zeros) {
   if (operands.empty()) {
     return;
   }
   printer << keyword << '(';
-  llvm::interleaveComma(llvm::zip_equal(operands, types, aliases), printer,
-                        [&](auto entry) {
-                          auto [operand, type, alias] = entry;
-                          printer << operand << " : " << type << " as ";
-                          printer.printOperand(alias);
-                        });
+  llvm::interleaveComma(
+      llvm::enumerate(llvm::zip_equal(operands, types, aliases)), printer,
+      [&](auto entry) {
+        auto [index, tuple] = entry;
+        auto [operand, type, alias] = tuple;
+        if (!zeros.empty() && zeros[index]) {
+          printer << "zero ";
+        }
+        printer << operand << " : " << type << " as ";
+        printer.printOperand(alias);
+      });
   printer << ") ";
 }
 
 static void printOracleAliasing(OpAsmPrinter& printer, Operation* op,
                                 OperandRange keptQubits, TypeRange keptTypes,
                                 OperandRange consumedQubits,
-                                TypeRange consumedTypes, Region& body) {
+                                TypeRange consumedTypes,
+                                DenseBoolArrayAttr consumedZeros,
+                                Region& body) {
   auto oracle = cast<OracleOp>(op);
   printOracleAliasGroup(printer, "kept", keptQubits, keptTypes,
-                        oracle.getKeptAliases());
+                        oracle.getKeptAliases(), {});
   printOracleAliasGroup(printer, "consumed", consumedQubits, consumedTypes,
-                        oracle.getConsumedAliases());
+                        oracle.getConsumedAliases(),
+                        consumedZeros ? consumedZeros.asArrayRef()
+                                      : ArrayRef<bool>{});
   printer.printRegion(body, /*printEntryBlockArgs=*/false);
 }
 

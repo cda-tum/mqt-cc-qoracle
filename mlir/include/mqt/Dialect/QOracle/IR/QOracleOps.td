@@ -62,9 +62,12 @@ def OracleOp : QOracleOp<"oracle", traits = [AttrSizedOperandSegments]> {
         |k⟩|c⟩ to |k⟩|f(k, c)⟩, where k are the kept operands, c the consumed
         ones and f the function computed by the region. Every auxiliary qubit
         introduced by the lowering is returned to |0⟩, so no garbage remains
-        entangled with the operands. f must be invertible in c for every fixed k,
-        otherwise the op is not unitary; the verifier cannot check this.
+        entangled with the operands. f must be invertible in c not marked as `zero`
+        for every fixed k, otherwise the op is not unitary.
         Passing the same qubit multiple times is not allowed.
+
+        Consumed operands marked  `zero` must be |0⟩ on entry.
+        Inside the region, their alias has a value of 0.
 
         Example:
         ```mlir
@@ -81,10 +84,11 @@ def OracleOp : QOracleOp<"oracle", traits = [AttrSizedOperandSegments]> {
   let arguments = (ins Arg<Variadic<OracleOperandType>,
                            "the kept target qubits", [MemRead]>:$kept_qubits,
       Arg<Variadic<OracleOperandType>,
-          "the consumed target qubits", [MemRead, MemWrite]>:$consumed_qubits);
+          "the consumed target qubits", [MemRead, MemWrite]>:$consumed_qubits,
+      OptionalAttr<DenseBoolArrayAttr>:$consumed_zeros);
   let regions = (region SizedRegion<1>:$region);
   let assemblyFormat = [{
-          custom<OracleAliasing>($kept_qubits, type($kept_qubits), $consumed_qubits, type($consumed_qubits), $region)
+          custom<OracleAliasing>($kept_qubits, type($kept_qubits), $consumed_qubits, type($consumed_qubits), $consumed_zeros, $region)
           attr-dict
       }];
 
@@ -100,6 +104,7 @@ def OracleOp : QOracleOp<"oracle", traits = [AttrSizedOperandSegments]> {
     bool ownsValue(::mlir::Value value);
     bool isKeptAlias(::mlir::Value value);
     bool isConsumedAlias(::mlir::Value value);
+    bool isZeroAlias(::mlir::Value value);
   }];
 }
 

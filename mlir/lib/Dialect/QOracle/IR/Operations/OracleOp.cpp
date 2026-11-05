@@ -51,6 +51,11 @@ LogicalResult OracleOp::verify() {
   if (arguments.size() != blockArgs.size()) {
     return emitOpError() << "has duplicate operands";
   }
+  auto zeros = getConsumedZerosAttr();
+  if (zeros &&
+      static_cast<size_t>(zeros.size()) != getConsumedQubits().size()) {
+    return emitOpError() << "must have one zero flag per consumed operand";
+  }
   return success();
 }
 
@@ -126,4 +131,14 @@ bool OracleOp::isKeptAlias(Value value) {
 
 bool OracleOp::isConsumedAlias(Value value) {
   return llvm::is_contained(getConsumedAliases(), value);
+}
+
+bool OracleOp::isZeroAlias(Value value) {
+  auto zeros = getConsumedZerosAttr();
+  if (!zeros) {
+    return false;
+  }
+  auto aliases = getConsumedAliases();
+  const auto* it = llvm::find(aliases, value);
+  return it != aliases.end() && zeros[it - aliases.begin()];
 }
