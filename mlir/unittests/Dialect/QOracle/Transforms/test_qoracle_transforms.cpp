@@ -403,6 +403,70 @@ TEST_F(QOracleTransformsTest, ReassociateStartsSumAtSingleUseTemporary) {
   EXPECT_TRUE(startsAt(sum, temporary)) << print(oracle);
 }
 
+// A single-use temporary has no qubits of its own; the lowering computes it
+// into fresh helpers. So a sum starts at it only when no other term can host,
+// as in SHA-256's W_t = ((s1 + W_{t-7}) + s0) + W_{t-16}.
+TEST_F(QOracleTransformsTest, ReassociatePrefersConsumedAliasOverTemporary) {
+  auto moduleOp = transform(R"mlir(
+    func.func @main() {
+      %a = memref.alloc() : memref<3x!qc.qubit>
+      %b = memref.alloc() : memref<3x!qc.qubit>
+      %d = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%a : memref<3x!qc.qubit> as %A,
+                          %b : memref<3x!qc.qubit> as %B,
+                          %d : memref<3x!qc.qubit> as %D)
+                     consumed(%c : memref<3x!qc.qubit> as %C) {
+        %x = arith.xori %A, %B : i3
+        %y = arith.xori %A, %D : i3
+        %s1 = arith.addi %x, %B : i3
+        %s2 = arith.addi %s1, %y : i3
+        %s3 = arith.addi %s2, %C : i3
+        qoracle.yield %s3 : i3
+      }
+      return
+    })mlir",
+                            REASSOCIATE);
+  ASSERT_TRUE(moduleOp);
+  auto oracle = findOracle(*moduleOp);
+  auto sum = collectSum(yieldedValue(oracle));
+  EXPECT_EQ(sum.additions.size(), 3U);
+  EXPECT_TRUE(isSingleChain(sum)) << print(oracle);
+  EXPECT_TRUE(startsAt(sum, oracle.getConsumedAliases()[0])) << print(oracle);
+}
+
+// The preferred host need not be an alias: `%w` is a sum with a second reader,
+// stored in the qubits of `%C`. In SHA-256, W_{t-16} for t >= 32 is such a sum.
+TEST_F(QOracleTransformsTest, ReassociatePrefersSharedSumOverTemporary) {
+  auto moduleOp = transform(R"mlir(
+    func.func @main() {
+      %a = memref.alloc() : memref<3x!qc.qubit>
+      %b = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      %d = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%a : memref<3x!qc.qubit> as %A,
+                          %b : memref<3x!qc.qubit> as %B)
+                     consumed(%c : memref<3x!qc.qubit> as %C,
+                              %d : memref<3x!qc.qubit> as %D) {
+        %w = arith.addi %C, %A : i3
+        %v = arith.xori %D, %w : i3
+        %x = arith.xori %A, %B : i3
+        %s1 = arith.addi %x, %B : i3
+        %s2 = arith.addi %s1, %w : i3
+        qoracle.yield %s2, %v : i3, i3
+      }
+      return
+    })mlir",
+                            REASSOCIATE);
+  ASSERT_TRUE(moduleOp);
+  auto oracle = findOracle(*moduleOp);
+  auto shared = oracle.getConsumedAliases()[0].getUsers().begin()->getResult(0);
+  ASSERT_TRUE(shared.getDefiningOp<arith::AddIOp>());
+  auto sum = collectSum(yieldedValue(oracle));
+  EXPECT_EQ(sum.additions.size(), 2U);
+  EXPECT_TRUE(startsAt(sum, shared)) << print(oracle);
+}
+
 TEST_F(QOracleTransformsTest, ReassociateNeverStartsSumAtKeptAlias) {
   // Every term is a kept alias or a captured value, so none may be overwritten.
   expectUnchanged(R"mlir(
