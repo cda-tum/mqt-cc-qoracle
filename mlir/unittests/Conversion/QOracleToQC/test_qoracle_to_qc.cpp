@@ -957,7 +957,7 @@ TEST_F(QOracleToQCTest, RejectsUnsupportedOperation) {
     %r = qc.alloc : !qc.qubit
     qoracle.oracle kept(%k : !qc.qubit as %vk)
                    consumed(%r : !qc.qubit as %vr) {
-      %next = arith.ori %vr, %vk : i1
+      %next = arith.muli %vr, %vk : i1
       qoracle.yield %next : i1
     })mlir",
                  "contains invalid operations");
@@ -1440,7 +1440,8 @@ TEST_F(QOracleToQCTest, RejectsShiftOutsideRotation) {
                  "contains invalid operations");
 }
 
-TEST_F(QOracleToQCTest, RejectsOrOutsideRotation) {
+// `r | a` loses information about `r`, so OR never overwrites an operand.
+TEST_F(QOracleToQCTest, RejectsOrIntoItsOperand) {
   expectRejected(R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
     %r = memref.alloc() : memref<4x!qc.qubit>
@@ -1449,7 +1450,7 @@ TEST_F(QOracleToQCTest, RejectsOrOutsideRotation) {
       %next = arith.ori %vr, %va : i4
       qoracle.yield %next : i4
     })mlir",
-                 "contains invalid operations");
+                 "yielded value 0 does not match");
 }
 
 TEST_F(QOracleToQCTest, RejectsShiftAmountsThatDoNotFormRotation) {
@@ -1766,6 +1767,284 @@ TEST_F(QOracleToQCTest, RejectsShiftByQuantumAmount) {
       qoracle.yield %next : i4
     })mlir",
                  "contains invalid operations");
+}
+
+// NOT is `xori x, -1`. A NOT of a kept register is applied in place with X
+// gates and undone at the end, as for any borrowed register, so it needs no
+// helpers.
+TEST_F(QOracleToQCTest, XorsInvertedKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %ones = arith.constant -1 : i4
+      %na = arith.xori %va, %ones : i4
+      %next = arith.xori %vr, %na : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] ^ ~in[0]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+// The form of Ch in FIPS 180-4: (e & f) ^ (~e & g).
+TEST_F(QOracleToQCTest, AndInvertedKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %e = memref.alloc() : memref<4x!qc.qubit>
+    %g = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%e : memref<4x!qc.qubit> as %ve,
+                        %g : memref<4x!qc.qubit> as %vg)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %ones = arith.constant -1 : i4
+      %ne = arith.xori %ve, %ones : i4
+      %and = arith.andi %ne, %vg : i4
+      %next = arith.xori %vr, %and : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (~in[0] & in[1])};
+  });
+  EXPECT_EQ(countHelpers(body), 4U);
+}
+
+TEST_F(QOracleToQCTest, XorsNandOfKeptRegisters) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %ones = arith.constant -1 : i4
+      %and = arith.andi %va, %vb : i4
+      %nand = arith.xori %and, %ones : i4
+      %next = arith.xori %vr, %nand : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ ~(in[0] & in[1])};
+  });
+}
+
+// r + ~a = r - a - 1, so the carries must see the inverted bits.
+TEST_F(QOracleToQCTest, AddsInvertedKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %ones = arith.constant -1 : i4
+      %na = arith.xori %va, %ones : i4
+      %next = arith.addi %vr, %na : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] + ~in[0]};
+  });
+  EXPECT_EQ(countHelpers(body), 1U);
+}
+
+// The top bit of `a >> 1` is known to be 0, so the top bit of its inverse is 1.
+TEST_F(QOracleToQCTest, XorsInvertedShift) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %ones = arith.constant -1 : i4
+      %sh = arith.shrui %va, %c1 : i4
+      %nsh = arith.xori %sh, %ones : i4
+      %next = arith.xori %vr, %nsh : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] ^ ~(in[0] >> 1)};
+  });
+}
+
+// A NOT of a kept register goes straight into the `zero` register: CNOTs, then
+// X gates.
+TEST_F(QOracleToQCTest, CreatesInvertedKeptRegisterInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %t = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(zero %t : memref<4x!qc.qubit> as %vt) {
+      %ones = arith.constant -1 : i4
+      %na = arith.xori %va, %ones : i4
+      qoracle.yield %na : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], ~in[0]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+// OR is computed as `t ^= x ^ y ^ (x & y)`: one Toffoli per bit, and one more
+// to uncompute the temporary.
+TEST_F(QOracleToQCTest, XorsOrOfKeptRegisters) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %or = arith.ori %va, %vb : i4
+      %next = arith.xori %vr, %or : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (in[0] | in[1])};
+  });
+  EXPECT_EQ(countHelpers(body), 4U);
+  EXPECT_EQ(countToffolis(body), 8U);
+}
+
+// The form of round 4 of MD5: c ^ (b | ~d). The NOT of `d` is applied in
+// place, so only the OR needs helpers.
+TEST_F(QOracleToQCTest, XorsOrWithInvertedKeptRegister) {
+  constexpr StringRef body = R"mlir(
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    %c = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%b : memref<4x!qc.qubit> as %vb,
+                        %d : memref<4x!qc.qubit> as %vd)
+                   consumed(%c : memref<4x!qc.qubit> as %vc) {
+      %ones = arith.constant -1 : i4
+      %nd = arith.xori %vd, %ones : i4
+      %or = arith.ori %vb, %nd : i4
+      %next = arith.xori %vc, %or : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (in[0] | ~in[1])};
+  });
+  EXPECT_EQ(countHelpers(body), 4U);
+  EXPECT_EQ(countToffolis(body), 8U);
+}
+
+TEST_F(QOracleToQCTest, AddsOrOfKeptRegisters) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %or = arith.ori %va, %vb : i4
+      %next = arith.addi %vr, %or : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] + (in[0] | in[1])};
+                 });
+}
+
+// A `zero` register starts at 0, so the OR is computed straight into it.
+TEST_F(QOracleToQCTest, CreatesOrInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %t = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(zero %t : memref<4x!qc.qubit> as %vt) {
+      %or = arith.ori %va, %vb : i4
+      qoracle.yield %or : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[0] | in[1]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_EQ(countToffolis(body), 4U);
+}
+
+// The top bit of `a >> 1` is known to be 0, so the top bit of the OR is `b3`.
+TEST_F(QOracleToQCTest, OrsShiftedKeptRegister) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %sh = arith.shrui %va, %c1 : i4
+      %or = arith.ori %sh, %vb : i4
+      %next = arith.xori %vr, %or : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] ^ ((in[0] >> 1) | in[1])};
+                 });
+}
+
+TEST_F(QOracleToQCTest, OrsConstant) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %five = arith.constant 5 : i4
+      %or = arith.ori %va, %five : i4
+      %next = arith.xori %vr, %or : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ (in[0] | 5U)};
+                 });
+}
+
+// An OR with two readers goes into a helper register: it is computed once and
+// cleaned up once, instead of twice as a temporary.
+TEST_F(QOracleToQCTest, CreatesSharedOrInHelperRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    %s = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr,
+                            %s : memref<3x!qc.qubit> as %vs) {
+      %or = arith.ori %va, %vb : i3
+      %nextR = arith.xori %vr, %or : i3
+      %nextS = arith.xori %vs, %or : i3
+      qoracle.yield %nextR, %nextS : i3, i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (in[0] | in[1]), in[3] ^ (in[0] | in[1])};
+  });
+  EXPECT_EQ(countToffolis(body), 6U);
+}
+
+TEST_F(QOracleToQCTest, OrsInsideLoop) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c0 = arith.constant 0 : index
+      %one = arith.constant 1 : index
+      %three = arith.constant 3 : index
+      %out = scf.for %i = %c0 to %three step %one
+          iter_args(%acc = %vd) -> (i4) {
+        %or = arith.ori %va, %vb : i4
+        %next = arith.addi %acc, %or : i4
+        scf.yield %next : i4
+      }
+      qoracle.yield %out : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] + (3 * (in[0] | in[1]))};
+                 });
 }
 
 // A `zero` register starts at 0, so a value whose operands must all be kept is
