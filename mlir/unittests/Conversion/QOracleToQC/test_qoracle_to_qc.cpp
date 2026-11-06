@@ -1860,6 +1860,201 @@ TEST_F(QOracleToQCTest, RejectsCreationOfUnsupportedOperation) {
       "an unsupported operation result is created in a zero register");
 }
 
+// `%t` has two users, so it is computed once into a helper register and
+// cleaned up once at the end: 2w Toffolis instead of 2w per user.
+TEST_F(QOracleToQCTest, CreatesSharedAndInHelperRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %x = memref.alloc() : memref<3x!qc.qubit>
+    %y = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%x : memref<3x!qc.qubit> as %vx,
+                            %y : memref<3x!qc.qubit> as %vy) {
+      %t = arith.andi %va, %vb : i3
+      %x1 = arith.xori %vx, %t : i3
+      %y1 = arith.xori %vy, %t : i3
+      qoracle.yield %x1, %y1 : i3, i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (in[0] & in[1]), in[3] ^ (in[0] & in[1])};
+  });
+  EXPECT_EQ(countToffolis(body), 6U);
+  EXPECT_EQ(countHelpers(body), 3U);
+}
+
+// A temporary sum costs one addition per step that reads it; a helper register
+// costs one to create it and one to clean it up. So with three users the
+// register saves an addition. `a` and `b` are read after `%t`, so neither can
+// be borrowed for the sum.
+TEST_F(QOracleToQCTest, CreatesSharedSumInHelperRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    %z = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy,
+                            %z : memref<2x!qc.qubit> as %vz) {
+      %t = arith.addi %va, %vb : i2
+      %x1 = arith.xori %vx, %t : i2
+      %y1 = arith.xori %vy, %t : i2
+      %z1 = arith.xori %vz, %t : i2
+      %x2 = arith.xori %x1, %va : i2
+      %y2 = arith.xori %y1, %vb : i2
+      qoracle.yield %x2, %y2, %z1 : i2, i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto sum = in[0] + in[1];
+    return {in[0], in[1], in[2] ^ sum ^ in[0], in[3] ^ sum ^ in[1],
+            in[4] ^ sum};
+  });
+  // Each 2-bit addition takes 2 Toffolis.
+  EXPECT_EQ(countToffolis(body), 4U);
+}
+
+// After `x` reads `%t`, `%t2` updates the helper register in place; R6 undoes
+// both steps in reverse.
+TEST_F(QOracleToQCTest, UpdatesHelperRegisterInPlace) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %c = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb,
+                        %c : memref<2x!qc.qubit> as %vc)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy) {
+      %t = arith.andi %va, %vb : i2
+      %x1 = arith.xori %vx, %t : i2
+      %t2 = arith.xori %t, %vc : i2
+      %y1 = arith.xori %vy, %t2 : i2
+      qoracle.yield %x1, %y1 : i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto t = in[0] & in[1];
+    return {in[0], in[1], in[2], in[3] ^ t, in[4] ^ t ^ in[2]};
+  });
+  EXPECT_EQ(countToffolis(body), 4U);
+  EXPECT_EQ(countHelpers(body), 2U);
+}
+
+// The temporary `%u` of the second step reads the helper register, which no
+// step overwrites.
+TEST_F(QOracleToQCTest, ReadsHelperRegisterInTemporary) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %c = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb,
+                        %c : memref<2x!qc.qubit> as %vc)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy) {
+      %t = arith.andi %va, %vb : i2
+      %x1 = arith.xori %vx, %t : i2
+      %u = arith.andi %t, %vc : i2
+      %y1 = arith.xori %vy, %u : i2
+      qoracle.yield %x1, %y1 : i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto t = in[0] & in[1];
+    return {in[0], in[1], in[2], in[3] ^ t, in[4] ^ (t & in[2])};
+  });
+  // `%t` once and its cleanup, plus `%u` and its cleanup.
+  EXPECT_EQ(countToffolis(body), 8U);
+}
+
+// R6 undoes the creation of `%t` before it restores the borrowed `a`, because
+// the creation reads `%s` from `a`.
+TEST_F(QOracleToQCTest, CleansUpHelperRegisterBeforeBorrowedRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy) {
+      %s = arith.addi %va, %vb : i2
+      %t = arith.andi %s, %vb : i2
+      %x1 = arith.xori %vx, %t : i2
+      %y1 = arith.xori %vy, %t : i2
+      qoracle.yield %x1, %y1 : i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto t = (in[0] + in[1]) & in[1];
+    return {in[0], in[1], in[2] ^ t, in[3] ^ t};
+  });
+  // The helper register of `%t` and one carry for each of the two additions
+  // on `a`. Without borrowing, `%s` would need two more helpers.
+  EXPECT_LE(countHelpers(body), 4U);
+}
+
+// Cleaning up `%t` would need the old value of `x`, which `%x1` overwrites. The
+// pass falls back to recomputing `%t` in each step and reports nothing.
+TEST_F(QOracleToQCTest, FallsBackToTemporariesWhenCleanupIsIllegal) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    %z = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy,
+                            %z : memref<2x!qc.qubit> as %vz) {
+      %t = arith.andi %va, %vx : i2
+      %y1 = arith.xori %vy, %t : i2
+      %z1 = arith.xori %vz, %t : i2
+      %x1 = arith.xori %vx, %va : i2
+      qoracle.yield %x1, %y1, %z1 : i2, i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto t = in[0] & in[1];
+    return {in[0], in[1] ^ in[0], in[2] ^ t, in[3] ^ t};
+  });
+  EXPECT_EQ(diagnostics, "");
+  EXPECT_EQ(countToffolis(body), 8U);
+}
+
+// Inverting a loop is not supported, so R6 cannot clean up a helper register
+// that a loop updates. Without helper registers, `%t` has no qubits to loop
+// over.
+TEST_F(QOracleToQCTest, RejectsLoopOverHelperRegister) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
+    %x = memref.alloc() : memref<2x!qc.qubit>
+    %y = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
+                   consumed(%x : memref<2x!qc.qubit> as %vx,
+                            %y : memref<2x!qc.qubit> as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %t = arith.andi %va, %vb : i2
+      %x1 = arith.xori %vx, %t : i2
+      %out = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%acc = %t) -> (i2) {
+        %next = arith.xori %acc, %va : i2
+        scf.yield %next : i2
+      }
+      %y1 = arith.xori %vy, %out : i2
+      qoracle.yield %x1, %y1 : i2, i2
+    })mlir",
+                 "a loop initial value is not stored in consumed qubits");
+}
+
 TEST_F(QOracleToQCTest, RepeatsLoopBody) {
   expectLowersTo(R"mlir(
     %a = memref.alloc() : memref<3x!qc.qubit>
@@ -2056,8 +2251,10 @@ TEST_F(QOracleToQCTest, RejectsLoopUsingItsInductionVariable) {
                  "uses its induction variable");
 }
 
-TEST_F(QOracleToQCTest, RejectsLoopReadingTemporaryFromOutside) {
-  expectRejected(R"mlir(
+// A value read inside a loop is computed once into a helper register before
+// the loop and cleaned up after the last step.
+TEST_F(QOracleToQCTest, ReadsHelperRegisterInsideLoop) {
+  expectLowersTo(R"mlir(
     %a = memref.alloc() : memref<2x!qc.qubit>
     %b = memref.alloc() : memref<2x!qc.qubit>
     %r = memref.alloc() : memref<2x!qc.qubit>
@@ -2066,16 +2263,18 @@ TEST_F(QOracleToQCTest, RejectsLoopReadingTemporaryFromOutside) {
                    consumed(%r : memref<2x!qc.qubit> as %vr) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
-      %c2 = arith.constant 2 : index
+      %c3 = arith.constant 3 : index
       %ab = arith.andi %va, %vb : i2
-      %out = scf.for %i = %c0 to %c2 step %c1
+      %out = scf.for %i = %c0 to %c3 step %c1
           iter_args(%acc = %vr) -> (i2) {
         %next = arith.xori %acc, %ab : i2
         scf.yield %next : i2
       }
       qoracle.yield %out : i2
     })mlir",
-                 "neither stored in qubits nor a constant");
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] ^ (in[0] & in[1])};
+                 });
 }
 
 TEST_F(QOracleToQCTest, RejectsLoopReadingValueItOverwrites) {
