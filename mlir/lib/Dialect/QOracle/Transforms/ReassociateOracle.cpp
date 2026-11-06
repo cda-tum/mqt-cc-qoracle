@@ -104,6 +104,17 @@ bool isSameChain(ArrayRef<Value> current, ArrayRef<Value> desired) {
          current.drop_front(2) == desired.drop_front(2);
 }
 
+bool canHost(Value term, Sum& sum, OracleOp oracle) {
+  return oracle.ownsValue(term) && canBeLastReader(sum, term);
+}
+
+bool isTemporary(Value term) {
+  return term.getDefiningOp() &&
+         isa<arith::XOrIOp, arith::AndIOp, arith::OrIOp, arith::ShRUIOp,
+             arith::ShLIOp>(term.getDefiningOp()) &&
+         term.hasOneUse();
+}
+
 struct ReassociateOraclePattern final : OpRewritePattern<arith::AddIOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -143,13 +154,24 @@ struct ReassociateOraclePattern final : OpRewritePattern<arith::AddIOp> {
 
     llvm::SmallVector<Value> reorderedTerms;
     bool foundHost = false;
+    auto oracle = addOp->getParentOfType<qoracle::OracleOp>();
     for (auto term : sum.terms) {
-      if (!foundHost && addOp->getParentOfType<OracleOp>().ownsValue(term) &&
-          canBeLastReader(sum, term)) {
+      if (!foundHost && canHost(term, sum, oracle) && !isTemporary(term)) {
         reorderedTerms.insert(reorderedTerms.begin(), term);
         foundHost = true;
       } else {
         reorderedTerms.push_back(term);
+      }
+    }
+    if (!foundHost) {
+      reorderedTerms.clear();
+      for (auto term : sum.terms) {
+        if (!foundHost && canHost(term, sum, oracle)) {
+          reorderedTerms.insert(reorderedTerms.begin(), term);
+          foundHost = true;
+        } else {
+          reorderedTerms.push_back(term);
+        }
       }
     }
 

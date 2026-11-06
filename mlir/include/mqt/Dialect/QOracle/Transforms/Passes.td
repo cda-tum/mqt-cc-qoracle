@@ -34,9 +34,11 @@ def ReassociateOracle : Pass<"qoracle-reassociate", "mlir::ModuleOp"> {
                 "computed in place";
   let description = [{
     Regroups chains of `arith.addi` in `qoracle.oracle` regions so that each sum
-    starts at an operand the lowering may overwrite: a consumed alias, or a
-    temporary value that the sum is the last to read. Kept aliases are never
-    overwritten. For example, with kept `a` and `b` and consumed `c`,
+    starts at an operand the lowering may overwrite: one that the sum is the
+    last to read and that is not a kept alias. Operands with qubits of their
+    own, such as consumed aliases and earlier sums, take priority over
+    single-use bitwise temporaries, which the lowering computes into fresh
+    helpers. For example, with kept `a` and `b` and consumed `c`,
     `(a + b) + c` becomes `a + (b + c)`, which can be computed in the qubits of
     `c` without a fresh register.
 
