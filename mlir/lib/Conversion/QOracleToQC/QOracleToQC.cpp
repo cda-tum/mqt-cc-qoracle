@@ -360,8 +360,16 @@ void computeInto(Operation* op, Statement::Kind kind,
                  SmallVector<Statement>& statements) {
   auto result = storageMap.at(op->getResult(0));
 
-  if (isa<arith::XOrIOp>(op) &&
-      (isFolded(op, op->getOperand(0)) || isFolded(op, op->getOperand(1)))) {
+  if (auto updatedBits = relabel(op, storageMap); succeeded(updatedBits)) {
+    auto bitWidth = updatedBits->size();
+    for (size_t i = 0; i < bitWidth; ++i) {
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::Xor,
+                            .target = result[i],
+                            .operands = {(*updatedBits)[i]}});
+    }
+  } else if (isa<arith::XOrIOp>(op) && (isFolded(op, op->getOperand(0)) ||
+                                        isFolded(op, op->getOperand(1)))) {
     Value folded =
         isFolded(op, op->getOperand(0)) ? op->getOperand(0) : op->getOperand(1);
     auto constant = *constantBits(folded);
@@ -376,12 +384,13 @@ void computeInto(Operation* op, Statement::Kind kind,
                             .operands = {otherBits[i]},
                             .invert = constant[i]});
     }
-  } else if (isa<arith::XOrIOp, arith::AndIOp>(op)) {
+  } else if (isa<arith::XOrIOp, arith::AndIOp, arith::OrIOp>(op)) {
     auto lhs = storageMap.at(op->getOperand(0));
     auto rhs = storageMap.at(op->getOperand(1));
 
-    auto operation =
-        isa<arith::XOrIOp>(op) ? Statement::Op::Xor : Statement::Op::And;
+    auto operation = isa<arith::XOrIOp>(op)   ? Statement::Op::Xor
+                     : isa<arith::AndIOp>(op) ? Statement::Op::And
+                                              : Statement::Op::Or;
     auto bitWidth = op->getResult(0).getType().getIntOrFloatBitWidth();
     for (size_t i = 0; i < bitWidth; ++i) {
       statements.push_back({.kind = kind,
@@ -423,15 +432,6 @@ void computeInto(Operation* op, Statement::Kind kind,
       auto additionStatements = createAdditionStatements(
           op->getResult(0), op->getOperand(1), kind, storageMap, allocator);
       statements.append(additionStatements.begin(), additionStatements.end());
-    }
-  } else if (auto updatedBits = relabel(op, storageMap);
-             succeeded(updatedBits)) {
-    auto bitWidth = updatedBits->size();
-    for (size_t i = 0; i < bitWidth; ++i) {
-      statements.push_back({.kind = kind,
-                            .op = Statement::Op::Xor,
-                            .target = result[i],
-                            .operands = {(*updatedBits)[i]}});
     }
   } else {
     llvm_unreachable("Unexpected temporary operation");
@@ -495,6 +495,12 @@ void dropZeroBits(SmallVector<Statement>& statements) {
     }
     if (statement.op == Statement::Op::Maj && nulls == 1) {
       statement.op = Statement::Op::And;
+    }
+    if (statement.op == Statement::Op::Or && nulls >= 2) {
+      continue;
+    }
+    if (statement.op == Statement::Op::Or && nulls == 1) {
+      statement.op = Statement::Op::Xor;
     }
     result.push_back(statement);
   }
@@ -1288,9 +1294,9 @@ FailureOr<DenseMap<Operation*, Value>> findCreations(OracleOp oracle) {
                          "while a value is created in its register");
       return failure();
     }
-    if (!isa<arith::XOrIOp, arith::AddIOp, arith::AndIOp, arith::ConstantOp>(
-            op) &&
-        failed(matchRotation(op)) && failed(matchShift(op))) {
+    if (!isa<arith::XOrIOp, arith::AddIOp, arith::AndIOp, arith::ConstantOp,
+             arith::OrIOp>(op) &&
+        failed(matchShift(op))) {
       oracle.emitOpError("cannot lower qoracle because an unsupported "
                          "operation result is created in a zero register");
       return failure();
@@ -1385,10 +1391,6 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
 bool validRegion(Block* block) {
   if (block
           ->walk([&](Operation* op) {
-            if (isa<arith::OrIOp>(op) && succeeded(matchRotation(op))) {
-              // OrIOps are allowed to represent a rotation.
-              return WalkResult::advance();
-            }
             if (succeeded(matchShift(op))) {
               // A right shift by a constant is a relabeling.
               return WalkResult::advance();
@@ -1399,8 +1401,9 @@ bool validRegion(Block* block) {
               return WalkResult::advance();
             }
             if (!isa<arith::ConstantOp, arith::XOrIOp, arith::AndIOp,
-                     arith::AddIOp, arith::ExtUIOp, arith::TruncIOp,
-                     qoracle::YieldOp, scf::ForOp, scf::YieldOp>(op)) {
+                     arith::AddIOp, arith::OrIOp, arith::ExtUIOp,
+                     arith::TruncIOp, qoracle::YieldOp, scf::ForOp,
+                     scf::YieldOp>(op)) {
               return WalkResult::interrupt();
             }
             if (!isa<qoracle::YieldOp>(op) && op->getNumOperands() == 2 &&
