@@ -122,11 +122,25 @@ struct Rotation {
   int64_t amount;
 };
 
+struct Shift {
+  Value source;
+  int64_t amount;
+};
+
 SmallVector<Value> rotateList(ArrayRef<Value> list, int64_t amount) {
   SmallVector<Value> result(list.size());
   size_t n = list.size();
   for (size_t i = 0; i < list.size(); ++i) {
     result[i] = list[(i - amount + n) % n];
+  }
+  return result;
+}
+
+SmallVector<Value> shiftList(ArrayRef<Value> list, int64_t amount) {
+  SmallVector<Value> result(list.size());
+  size_t n = list.size();
+  for (size_t i = 0; i < list.size(); ++i) {
+    result[i] = i + amount < n ? list[i + amount] : Value{};
   }
   return result;
 }
@@ -144,6 +158,22 @@ void sortBits(ArrayRef<Value> current, ArrayRef<Value> desired, Location loc,
     *it = currentList[i];
     currentList[i] = desired[i];
   }
+}
+
+FailureOr<Shift> matchShift(Operation* op) {
+  auto shr = dyn_cast<arith::ShRUIOp>(op);
+  if (!shr) {
+    return failure();
+  }
+  auto bitWidth = shr.getType().getIntOrFloatBitWidth();
+  auto k = getConstantIntValue(shr.getRhs());
+  if (!k || *k <= 0 || *k >= bitWidth) {
+    return failure();
+  }
+  return Shift{
+      .source = shr.getLhs(),
+      .amount = *k,
+  };
 }
 
 FailureOr<Rotation> matchRotation(Operation* op) {
@@ -179,10 +209,27 @@ FailureOr<Rotation> matchRotation(Operation* op) {
   return failure();
 }
 
+FailureOr<SmallVector<Value>>
+relabel(Operation* op, DenseMap<Value, SmallVector<Value>>& storageMap) {
+  auto rotation = matchRotation(op);
+  if (succeeded(rotation)) {
+    return rotateList(storageMap.at(rotation->source), rotation->amount);
+  }
+  auto shift = matchShift(op);
+  if (succeeded(shift)) {
+    return shiftList(storageMap.at(shift->source), shift->amount);
+  }
+  return failure();
+}
+
 SmallVector<Value> getTemporaryInputs(Operation* op) {
   auto result = matchRotation(op);
   if (succeeded(result)) {
     return {result->source};
+  }
+  auto shift = matchShift(op);
+  if (succeeded(shift)) {
+    return {shift->source};
   }
   return llvm::to_vector(op->getOperands());
 }
@@ -377,14 +424,14 @@ void computeInto(Operation* op, Statement::Kind kind,
           op->getResult(0), op->getOperand(1), kind, storageMap, allocator);
       statements.append(additionStatements.begin(), additionStatements.end());
     }
-  } else if (auto rotation = matchRotation(op); succeeded(rotation)) {
-    auto source = rotateList(storageMap.at(rotation->source), rotation->amount);
-    auto bitWidth = source.size();
+  } else if (auto updatedBits = relabel(op, storageMap);
+             succeeded(updatedBits)) {
+    auto bitWidth = updatedBits->size();
     for (size_t i = 0; i < bitWidth; ++i) {
       statements.push_back({.kind = kind,
                             .op = Statement::Op::Xor,
                             .target = result[i],
-                            .operands = {source[i]}});
+                            .operands = {(*updatedBits)[i]}});
     }
   } else {
     llvm_unreachable("Unexpected temporary operation");
@@ -407,7 +454,7 @@ bool needsRegister(Operation* op) {
   if (isa<arith::ConstantOp, arith::ExtUIOp, arith::TruncIOp>(op)) {
     return false;
   }
-  if (succeeded(matchRotation(op))) {
+  if (succeeded(matchRotation(op)) || succeeded(matchShift(op))) {
     return false;
   }
 
@@ -423,6 +470,37 @@ bool needsRegister(Operation* op) {
   return true;
 }
 
+void dropZeroBits(SmallVector<Statement>& statements) {
+  SmallVector<Statement> result;
+  for (auto& statement : statements) {
+    SmallVector<Value> newOperands;
+    size_t nulls = 0;
+    for (auto operand : statement.operands) {
+      if (!operand) {
+        nulls += 1;
+        continue;
+      }
+      newOperands.push_back(operand);
+    }
+    statement.operands = newOperands;
+    if (statement.op == Statement::Op::Xor && newOperands.empty() &&
+        !statement.invert) {
+      continue;
+    }
+    if (statement.op == Statement::Op::And && nulls > 0) {
+      continue;
+    }
+    if (statement.op == Statement::Op::Maj && nulls >= 2) {
+      continue;
+    }
+    if (statement.op == Statement::Op::Maj && nulls == 1) {
+      statement.op = Statement::Op::And;
+    }
+    result.push_back(statement);
+  }
+  statements = result;
+}
+
 SmallVector<Statement>
 buildStatements(const UpdateStep& update,
                 DenseMap<Value, SmallVector<Value>>& storageMap,
@@ -430,7 +508,8 @@ buildStatements(const UpdateStep& update,
   SmallVector<Statement> statements;
   for (const auto& temporary : update.temporaries) {
     if (isa<arith::ExtUIOp, arith::TruncIOp>(temporary) ||
-        succeeded(matchRotation(temporary))) {
+        succeeded(matchRotation(temporary)) ||
+        succeeded(matchShift(temporary))) {
       continue;
     }
     computeInto(temporary, Statement::Kind::Temp, storageMap, allocator,
@@ -481,6 +560,7 @@ buildStatements(const UpdateStep& update,
   } else {
     llvm_unreachable("Unexpected update operation");
   }
+  dropZeroBits(statements);
   return statements;
 }
 
@@ -727,10 +807,9 @@ void emitUpdateStep(const UpdateStep& step,
       .outerLoop = outerLoop, .loc = loc, .rewriter = rewriter};
 
   for (auto* temporary : step.temporaries) {
-    auto temporaryRotation = matchRotation(temporary);
-    if (succeeded(temporaryRotation)) {
-      storageMap[temporary->getResult(0)] = rotateList(
-          storageMap.at(temporaryRotation->source), temporaryRotation->amount);
+    auto temporaryBits = relabel(temporary, storageMap);
+    if (succeeded(temporaryBits)) {
+      storageMap[temporary->getResult(0)] = *temporaryBits;
       continue;
     }
 
@@ -1211,7 +1290,7 @@ FailureOr<DenseMap<Operation*, Value>> findCreations(OracleOp oracle) {
     }
     if (!isa<arith::XOrIOp, arith::AddIOp, arith::AndIOp, arith::ConstantOp>(
             op) &&
-        failed(matchRotation(op))) {
+        failed(matchRotation(op)) && failed(matchShift(op))) {
       oracle.emitOpError("cannot lower qoracle because an unsupported "
                          "operation result is created in a zero register");
       return failure();
@@ -1308,6 +1387,10 @@ bool validRegion(Block* block) {
           ->walk([&](Operation* op) {
             if (isa<arith::OrIOp>(op) && succeeded(matchRotation(op))) {
               // OrIOps are allowed to represent a rotation.
+              return WalkResult::advance();
+            }
+            if (succeeded(matchShift(op))) {
+              // A right shift by a constant is a relabeling.
               return WalkResult::advance();
             }
             if (isa<arith::ShLIOp, arith::ShRUIOp>(op) && op->hasOneUse() &&
