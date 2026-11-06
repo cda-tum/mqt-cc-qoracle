@@ -127,6 +127,12 @@ struct Shift {
   int64_t amount;
 };
 
+struct Majority {
+  Value x;
+  Value y;
+  Value z;
+};
+
 SmallVector<Value> rotateList(ArrayRef<Value> list, int64_t amount) {
   SmallVector<Value> result(list.size());
   size_t n = list.size();
@@ -222,6 +228,65 @@ relabel(Operation* op, DenseMap<Value, SmallVector<Value>>& storageMap) {
   return failure();
 }
 
+FailureOr<Majority> majorityOf(arith::AndIOp a, arith::AndIOp b,
+                               arith::AndIOp c) {
+  SetVector<Value> inputs;
+  SetVector<Value> doubles;
+  for (auto op : {a, b, c}) {
+    for (auto operand : op.getOperands()) {
+      if (!inputs.insert(operand)) {
+        doubles.insert(operand);
+      }
+    }
+  }
+  if (inputs.size() != 3 || doubles.size() != 3) {
+    return failure();
+  }
+  return Majority{
+      .x = inputs[0],
+      .y = inputs[1],
+      .z = inputs[2],
+  };
+}
+
+FailureOr<Majority> matchMajority(Operation* op) {
+  if (!isa<arith::OrIOp, arith::XOrIOp>(op)) {
+    return failure();
+  }
+  auto lhs = op->getOperand(0);
+  auto rhs = op->getOperand(1);
+  for (auto [single, pair] : {std::pair{lhs, rhs}, std::pair{rhs, lhs}}) {
+    auto andOp = single.getDefiningOp<arith::AndIOp>();
+    auto innerOp = pair.getDefiningOp();
+    if (!andOp || !innerOp || !andOp->hasOneUse() || !innerOp->hasOneUse() ||
+        !isa<arith::OrIOp, arith::XOrIOp>(innerOp)) {
+      continue;
+    }
+    auto and1 = innerOp->getOperand(0).getDefiningOp<arith::AndIOp>();
+    auto and2 = innerOp->getOperand(1).getDefiningOp<arith::AndIOp>();
+    if (!and1 || !and2 || !and1->hasOneUse() || !and2->hasOneUse()) {
+      continue;
+    }
+    return majorityOf(and1, and2, andOp);
+  }
+  return failure();
+}
+
+Operation* majorityRoot(Operation* op) {
+  if (!isa<arith::AndIOp>(op) || !op->hasOneUse()) {
+    return nullptr;
+  }
+  auto user = *op->getUsers().begin();
+  if (succeeded(matchMajority(user))) {
+    return user;
+  }
+  if (user->hasOneUse() &&
+      succeeded(matchMajority(*user->getUsers().begin()))) {
+    return *user->getUsers().begin();
+  }
+  return nullptr;
+}
+
 SmallVector<Value> getTemporaryInputs(Operation* op) {
   auto result = matchRotation(op);
   if (succeeded(result)) {
@@ -230,6 +295,10 @@ SmallVector<Value> getTemporaryInputs(Operation* op) {
   auto shift = matchShift(op);
   if (succeeded(shift)) {
     return {shift->source};
+  }
+  auto maj = matchMajority(op);
+  if (succeeded(maj)) {
+    return {maj->x, maj->y, maj->z};
   }
   return llvm::to_vector(op->getOperands());
 }
@@ -368,6 +437,16 @@ void computeInto(Operation* op, Statement::Kind kind,
                             .target = result[i],
                             .operands = {(*updatedBits)[i]}});
     }
+  } else if (auto majority = matchMajority(op); succeeded(majority)) {
+    auto xs = storageMap.at(majority->x);
+    auto ys = storageMap.at(majority->y);
+    auto zs = storageMap.at(majority->z);
+    for (size_t i = 0; i < xs.size(); ++i) {
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::Maj,
+                            .target = result[i],
+                            .operands = {xs[i], ys[i], zs[i]}});
+    }
   } else if (isa<arith::XOrIOp>(op) && (isFolded(op, op->getOperand(0)) ||
                                         isFolded(op, op->getOperand(1)))) {
     Value folded =
@@ -444,6 +523,9 @@ SetVector<Operation*> readers(Value value) {
     if (isa<arith::ShLIOp, arith::ShRUIOp>(user) && user->hasOneUse() &&
         succeeded(matchRotation(*user->user_begin()))) {
       user = *user->user_begin();
+    }
+    if (auto* majRoot = majorityRoot(user)) {
+      user = majRoot;
     }
     result.insert(user);
   }
@@ -1251,6 +1333,9 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
 
 Value chainInput(Operation* op, OracleOp oracle) {
   if (!isa<arith::XOrIOp, arith::AddIOp>(op) && failed(matchRotation(op))) {
+    return nullptr;
+  }
+  if (succeeded(matchMajority(op))) {
     return nullptr;
   }
   for (auto input : getTemporaryInputs(op)) {
