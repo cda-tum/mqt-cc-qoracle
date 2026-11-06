@@ -2047,6 +2047,263 @@ TEST_F(QOracleToQCTest, OrsInsideLoop) {
                  });
 }
 
+// The majority of `a`, `b` and `c`, as mlir_emit writes it. Recognized as one
+// operation, it is computed in place in one of its operands with one Toffoli
+// per bit, and undone with one more. Three separate ANDs cost far more.
+TEST_F(QOracleToQCTest, XorsMajority) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i3
+      %ac = arith.andi %va, %vc : i3
+      %bc = arith.andi %vb, %vc : i3
+      %or = arith.ori %ab, %ac : i3
+      %maj = arith.ori %or, %bc : i3
+      %next = arith.xori %vr, %maj : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2],
+            in[3] ^ ((in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2]))};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 6U);
+}
+
+// The form of Maj in FIPS 180-4: (a & b) ^ (a & c) ^ (b & c).
+TEST_F(QOracleToQCTest, XorsMajorityWrittenWithXor) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i3
+      %ac = arith.andi %va, %vc : i3
+      %bc = arith.andi %vb, %vc : i3
+      %x = arith.xori %ab, %ac : i3
+      %maj = arith.xori %x, %bc : i3
+      %next = arith.xori %vr, %maj : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2],
+            in[3] ^ ((in[0] & in[1]) ^ (in[0] & in[2]) ^ (in[1] & in[2]))};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 6U);
+}
+
+// The pairs may come in any order, with their operands swapped and either side
+// nested, and `|` and `^` may be mixed: no two of the three ANDs are 1 at once.
+TEST_F(QOracleToQCTest, RecognizesMajorityInAnyOrder) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %cb = arith.andi %vc, %vb : i3
+      %ba = arith.andi %vb, %va : i3
+      %ca = arith.andi %vc, %va : i3
+      %x = arith.xori %ba, %ca : i3
+      %maj = arith.ori %cb, %x : i3
+      %next = arith.xori %vr, %maj : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2],
+            in[3] ^ ((in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2]))};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 6U);
+}
+
+// The prototype needs one carry helper and 10 Toffolis: 6 for the adder and
+// 4 for the majority and its inverse.
+TEST_F(QOracleToQCTest, AddsMajority) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i3
+      %ac = arith.andi %va, %vc : i3
+      %bc = arith.andi %vb, %vc : i3
+      %or = arith.ori %ab, %ac : i3
+      %maj = arith.ori %or, %bc : i3
+      %next = arith.addi %vr, %maj : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2],
+            in[3] + ((in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2]))};
+  });
+  EXPECT_LE(countHelpers(body), 1U);
+  EXPECT_LE(countToffolis(body), 10U);
+}
+
+// The pattern of SHA-256's r + S0(a) + Maj(a, b, c), regrouped as R4 does: the
+// rotation reads `a` too, so the majority must be computed in place in `b` or
+// `c`. Each addition allocates its own carry helper and frees it again.
+TEST_F(QOracleToQCTest, AddsRotationAndMajorityOfSameRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i3
+      %c2 = arith.constant 2 : i3
+      %hi = arith.shli %va, %c1 : i3
+      %lo = arith.shrui %va, %c2 : i3
+      %rot = arith.ori %hi, %lo : i3
+      %ab = arith.andi %va, %vb : i3
+      %ac = arith.andi %va, %vc : i3
+      %bc = arith.andi %vb, %vc : i3
+      %or = arith.ori %ab, %ac : i3
+      %maj = arith.ori %or, %bc : i3
+      %sum = arith.addi %vr, %rot : i3
+      %next = arith.addi %sum, %maj : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    const auto maj = (in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2]);
+    return {in[0], in[1], in[2], in[3] + rotl(in[0], 1, 3) + maj};
+  });
+  EXPECT_EQ(countHelpers(body), 2U);
+  EXPECT_LE(countToffolis(body), 14U);
+}
+
+// A `zero` register starts at 0, so the majority is computed straight into
+// it, with one Toffoli per bit.
+TEST_F(QOracleToQCTest, CreatesMajorityInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %t = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(zero %t : memref<3x!qc.qubit> as %vt) {
+      %ab = arith.andi %va, %vb : i3
+      %ac = arith.andi %va, %vc : i3
+      %bc = arith.andi %vb, %vc : i3
+      %or = arith.ori %ab, %ac : i3
+      %maj = arith.ori %or, %bc : i3
+      qoracle.yield %maj : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2],
+            (in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2])};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_EQ(countToffolis(body), 3U);
+}
+
+// `b & d` breaks the pattern, so this is not a majority. A recognizer that
+// checks only the shape would compute the wrong function.
+TEST_F(QOracleToQCTest, LowersNearMajority) {
+  expectLowersTo(
+      R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %d = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc,
+                        %d : memref<3x!qc.qubit> as %vd)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i3
+      %ac = arith.andi %va, %vc : i3
+      %bd = arith.andi %vb, %vd : i3
+      %x = arith.xori %ab, %ac : i3
+      %y = arith.xori %x, %bd : i3
+      %next = arith.xori %vr, %y : i3
+      qoracle.yield %next : i3
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues {
+        return {in[0], in[1], in[2], in[3],
+                in[4] ^ ((in[0] & in[1]) ^ (in[0] & in[2]) ^ (in[1] & in[3]))};
+      });
+}
+
+// The inner OR reads a register directly, not an AND, so this is no majority.
+TEST_F(QOracleToQCTest, LowersOrOfRegisterAndPairs) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %ab = arith.andi %va, %vb : i3
+      %bc = arith.andi %vb, %vc : i3
+      %x = arith.ori %va, %ab : i3
+      %y = arith.ori %x, %bc : i3
+      %next = arith.xori %vr, %y : i3
+      qoracle.yield %next : i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2],
+                           in[3] ^ (in[0] | (in[0] & in[1]) | (in[1] & in[2]))};
+                 });
+}
+
+// `a & b` has a second reader, so the pattern cannot absorb it. The circuit
+// is still correct.
+TEST_F(QOracleToQCTest, LowersMajorityWithSharedPair) {
+  expectLowersTo(
+      R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    %s = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr,
+                            %s : memref<3x!qc.qubit> as %vs) {
+      %ab = arith.andi %va, %vb : i3
+      %ac = arith.andi %va, %vc : i3
+      %bc = arith.andi %vb, %vc : i3
+      %or = arith.ori %ab, %ac : i3
+      %maj = arith.ori %or, %bc : i3
+      %nextR = arith.xori %vr, %maj : i3
+      %nextS = arith.xori %vs, %ab : i3
+      qoracle.yield %nextR, %nextS : i3, i3
+    })mlir",
+      [](ArrayRef<uint64_t> in) -> RegisterValues {
+        const auto maj = (in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2]);
+        return {in[0], in[1], in[2], in[3] ^ maj, in[4] ^ (in[0] & in[1])};
+      });
+}
+
 // A `zero` register starts at 0, so a value whose operands must all be kept is
 // computed into it: a copy of `a`, then an in-place addition of `b`.
 TEST_F(QOracleToQCTest, CreatesSumInZeroRegister) {
