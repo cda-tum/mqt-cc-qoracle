@@ -166,6 +166,18 @@ struct ReassociateOraclePattern final : OpRewritePattern<arith::AddIOp> {
     if (!foundHost) {
       reorderedTerms.clear();
       for (auto term : sum.terms) {
+        if (!foundHost && oracle.isKeptAlias(term) &&
+            canBeLastReader(sum, term)) {
+          reorderedTerms.insert(reorderedTerms.begin(), term);
+          foundHost = true;
+        } else {
+          reorderedTerms.push_back(term);
+        }
+      }
+    }
+    if (!foundHost) {
+      reorderedTerms.clear();
+      for (auto term : sum.terms) {
         if (!foundHost && canHost(term, sum, oracle)) {
           reorderedTerms.insert(reorderedTerms.begin(), term);
           foundHost = true;

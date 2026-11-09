@@ -276,6 +276,19 @@ static void collectSum(Value value, Sum& sum) {
   });
 }
 
+/// The root of the only sum in `oracle`: the addition no other addition reads.
+[[nodiscard]] static Value sumRoot(qoracle::OracleOp oracle) {
+  Value root;
+  oracle.walk([&](arith::AddIOp op) {
+    if (llvm::none_of(op->getUsers(), [](Operation* user) {
+          return isa<arith::AddIOp>(user);
+        })) {
+      root = op.getResult();
+    }
+  });
+  return root;
+}
+
 [[nodiscard]] static Value yieldedValue(qoracle::OracleOp oracle) {
   return oracle.getRegion().front().getTerminator()->getOperand(0);
 }
@@ -373,6 +386,7 @@ TEST_F(QOracleTransformsTest, ReassociateStartsSumAtConsumedAlias) {
   EXPECT_TRUE(startsAt(sum, oracle.getConsumedAliases()[0])) << print(oracle);
 }
 
+// Both kept aliases are read after the sum, so only the temporary can host it.
 TEST_F(QOracleTransformsTest, ReassociateStartsSumAtSingleUseTemporary) {
   auto moduleOp = transform(R"mlir(
     func.func @main() {
@@ -386,7 +400,9 @@ TEST_F(QOracleTransformsTest, ReassociateStartsSumAtSingleUseTemporary) {
         %u = arith.addi %A, %B : i3
         %s = arith.addi %u, %t : i3
         %r = arith.xori %C, %s : i3
-        qoracle.yield %r : i3
+        %rA = arith.xori %r, %A : i3
+        %rB = arith.xori %rA, %B : i3
+        qoracle.yield %rB : i3
       }
       return
     })mlir",
@@ -396,11 +412,39 @@ TEST_F(QOracleTransformsTest, ReassociateStartsSumAtSingleUseTemporary) {
   arith::AndIOp temporary;
   oracle.walk([&](arith::AndIOp op) { temporary = op; });
   ASSERT_TRUE(temporary);
-  auto xorOp = yieldedValue(oracle).getDefiningOp<arith::XOrIOp>();
-  ASSERT_TRUE(xorOp);
-  auto sum = collectSum(xorOp.getRhs());
+  auto sum = collectSum(sumRoot(oracle));
   EXPECT_EQ(sum.additions.size(), 2U);
   EXPECT_TRUE(startsAt(sum, temporary)) << print(oracle);
+}
+
+// A kept alias that the sum reads last can host it: the lowering may borrow
+// it. It takes priority over single-use temporaries, as the message words of
+// SHA-256 do over its sigma terms.
+TEST_F(QOracleTransformsTest, ReassociatePrefersKeptAliasOverTemporary) {
+  auto moduleOp = transform(R"mlir(
+    func.func @main() {
+      %a = memref.alloc() : memref<3x!qc.qubit>
+      %w = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%a : memref<3x!qc.qubit> as %A,
+                          %w : memref<3x!qc.qubit> as %W)
+                     consumed(%c : memref<3x!qc.qubit> as %C) {
+        %x = arith.andi %A, %C : i3
+        %y = arith.xori %A, %C : i3
+        %s1 = arith.addi %x, %y : i3
+        %s = arith.addi %s1, %W : i3
+        %r = arith.xori %C, %s : i3
+        %rA = arith.xori %r, %A : i3
+        qoracle.yield %rA : i3
+      }
+      return
+    })mlir",
+                            REASSOCIATE);
+  ASSERT_TRUE(moduleOp);
+  auto oracle = findOracle(*moduleOp);
+  auto sum = collectSum(sumRoot(oracle));
+  EXPECT_EQ(sum.additions.size(), 2U);
+  EXPECT_TRUE(startsAt(sum, oracle.getKeptAliases()[1])) << print(oracle);
 }
 
 // A single-use temporary has no qubits of its own; the lowering computes it

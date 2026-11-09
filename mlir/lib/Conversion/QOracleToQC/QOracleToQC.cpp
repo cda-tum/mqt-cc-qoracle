@@ -82,6 +82,7 @@ struct Statement {
   bool invert = false;
   bool inPlace = false;
   bool fused = false;
+  SmallVector<bool> negated;
 };
 
 struct HelperAllocator {
@@ -287,6 +288,18 @@ Operation* majorityRoot(Operation* op) {
   return nullptr;
 }
 
+bool isConstantEquality(Operation* op) {
+  auto cmp = dyn_cast<arith::CmpIOp>(op);
+  if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::eq) {
+    return false;
+  }
+  auto* lhs = cmp.getLhs().getDefiningOp();
+  auto* rhs = cmp.getRhs().getDefiningOp();
+  auto leftConst = lhs && isa<arith::ConstantOp>(lhs);
+  auto rightConst = rhs && isa<arith::ConstantOp>(rhs);
+  return leftConst ^ rightConst;
+}
+
 SmallVector<Value> getTemporaryInputs(Operation* op) {
   auto result = matchRotation(op);
   if (succeeded(result)) {
@@ -299,6 +312,11 @@ SmallVector<Value> getTemporaryInputs(Operation* op) {
   auto maj = matchMajority(op);
   if (succeeded(maj)) {
     return {maj->x, maj->y, maj->z};
+  }
+  if (isConstantEquality(op)) {
+    auto cmp = cast<arith::CmpIOp>(op);
+    return {cmp.getLhs().getDefiningOp<arith::ConstantOp>() ? cmp.getRhs()
+                                                            : cmp.getLhs()};
   }
   return llvm::to_vector(op->getOperands());
 }
@@ -437,6 +455,69 @@ void computeInto(Operation* op, Statement::Kind kind,
                             .target = result[i],
                             .operands = {(*updatedBits)[i]}});
     }
+  } else if (isConstantEquality(op)) {
+    auto lhs = op->getOperand(0);
+    auto rhs = op->getOperand(1);
+    auto constant = lhs.getDefiningOp<arith::ConstantOp>() ? lhs : rhs;
+    auto other = lhs.getDefiningOp<arith::ConstantOp>() ? rhs : lhs;
+    auto c = *constantBits(constant);
+    auto bits = storageMap.at(other);
+    SmallVector<std::pair<Value, bool>> inputs;
+    for (size_t i = 0; i < c.getBitWidth(); ++i) {
+      if (!bits[i]) {
+        if (c[i]) {
+          return;
+        }
+        continue;
+      }
+      inputs.push_back({bits[i], !c[i]});
+    }
+
+    if (inputs.empty()) {
+      statements.push_back({.kind = kind,
+                            .op = Statement::Op::Xor,
+                            .target = result[0],
+                            .operands = {},
+                            .invert = true});
+    } else {
+      while (inputs.size() > 2) {
+        SmallVector<std::pair<Value, bool>> nextInputs;
+        for (size_t i = 0; i + 1 < inputs.size(); i += 2) {
+          auto [p, notP] = inputs[i];
+          auto [q, notQ] = inputs[i + 1];
+          auto h = allocator.allocate();
+          statements.push_back({
+              .kind = Statement::Kind::Temp,
+              .op = Statement::Op::And,
+              .target = h,
+              .operands = {p, q},
+              .negated = {notP, notQ},
+          });
+          nextInputs.push_back({h, false});
+        }
+        if (inputs.size() % 2 == 1) {
+          nextInputs.push_back(inputs.back());
+        }
+        inputs = nextInputs;
+      }
+      if (inputs.size() == 2) {
+        statements.push_back({
+            .kind = kind,
+            .op = Statement::Op::And,
+            .target = result[0],
+            .operands = {inputs[0].first, inputs[1].first},
+            .negated = {inputs[0].second, inputs[1].second},
+        });
+      } else {
+        statements.push_back({
+            .kind = kind,
+            .op = Statement::Op::Xor,
+            .target = result[0],
+            .operands = {inputs[0].first},
+            .invert = inputs[0].second,
+        });
+      }
+    }
   } else if (auto majority = matchMajority(op); succeeded(majority)) {
     auto xs = storageMap.at(majority->x);
     auto ys = storageMap.at(majority->y);
@@ -544,6 +625,9 @@ bool needsRegister(Operation* op) {
   auto value = op->getResult(0);
   if (value.use_empty()) {
     return false;
+  }
+  if (isConstantEquality(op)) {
+    return !(op->hasOneUse() && isa<arith::XOrIOp>(*op->user_begin()));
   }
   if (isa<arith::AddIOp>(op)) {
     return true;
@@ -707,7 +791,17 @@ void emitStatement(const Statement& statement, Location loc,
                    PatternRewriter& rewriter) {
   auto target = statement.target;
   if (statement.op == Statement::Op::And) {
+    for (size_t i = 0; i < statement.negated.size(); ++i) {
+      if (statement.negated[i]) {
+        emitGate(loc, {}, statement.operands[i], rewriter);
+      }
+    }
     emitGate(loc, statement.operands, target, rewriter);
+    for (size_t i = 0; i < statement.negated.size(); ++i) {
+      if (statement.negated[i]) {
+        emitGate(loc, {}, statement.operands[i], rewriter);
+      }
+    }
   } else if (statement.op == Statement::Op::Xor) {
     for (auto control : statement.operands) {
       emitGate(loc, {control}, target, rewriter);
@@ -1457,7 +1551,7 @@ FailureOr<DenseMap<Operation*, Value>> findCreations(OracleOp oracle) {
     }
     if (!isa<arith::XOrIOp, arith::AddIOp, arith::AndIOp, arith::ConstantOp,
              arith::OrIOp>(op) &&
-        failed(matchShift(op))) {
+        failed(matchShift(op)) && !isConstantEquality(op)) {
       oracle.emitOpError("cannot lower qoracle because an unsupported "
                          "operation result is created in a zero register");
       return failure();
@@ -1559,6 +1653,10 @@ bool validRegion(Block* block) {
             if (isa<arith::ShLIOp, arith::ShRUIOp>(op) && op->hasOneUse() &&
                 succeeded(matchRotation(*op->getUsers().begin()))) {
               // Shifts used inside a rotation are allowed.
+              return WalkResult::advance();
+            }
+            if (isConstantEquality(op)) {
+              // Constant equalities represent predicates
               return WalkResult::advance();
             }
             if (!isa<arith::ConstantOp, arith::XOrIOp, arith::AndIOp,
@@ -1678,9 +1776,6 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
       continue;
     }
     emitInverseStep(step, storageMap, loc, rewriter);
-  }
-
-  for (const auto& step : updateSteps) {
     if (step.kind == UpdateStep::Kind::Create &&
         step.overwriteValue == step.updateOp->getResult(0)) {
       for (auto qubit : storageMap.at(step.overwriteValue)) {

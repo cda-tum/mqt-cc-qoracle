@@ -3493,8 +3493,9 @@ TEST_F(QOracleToQCTest, AndComparisonsOfTwoRegisters) {
     return {in[0], in[1],
             in[2] ^ static_cast<uint64_t>(in[0] == 5 && in[1] == 2)};
   });
-  // Two comparisons of two Toffolis each and one AND, computed and undone.
-  EXPECT_LE(countToffolis(body), 10U);
+  // Each comparison runs in its own step and is undone again by R6: three
+  // Toffolis each time, plus two for the AND into the target.
+  EXPECT_LE(countToffolis(body), 14U);
 }
 
 // The compared word is computed first; its register is cleaned up afterwards.
@@ -3543,6 +3544,85 @@ TEST_F(QOracleToQCTest, ComparesFeedForwardChainWithConstant) {
                    const auto f = ((a1 + in[0]) ^ (in[1] ^ a1)) & 0xF;
                    return {in[0], in[1], in[2] ^ static_cast<uint64_t>(f == 6)};
                  });
+}
+
+// Created in a `zero` qubit, the comparison is an Update; its AND tree and the
+// flips of the bits where 5 has a 0 are still temporaries and must be undone.
+TEST_F(QOracleToQCTest, CreatesComparisonInZeroQubit) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %t = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(zero %t : !qc.qubit as %vt) {
+      %c5 = arith.constant 5 : i4
+      %eq = arith.cmpi eq, %va, %c5 : i4
+      qoracle.yield %eq : i1
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], static_cast<uint64_t>(in[0] == 5)};
+                 });
+}
+
+// Each comparison gets its own step and a one-qubit result, so only one AND
+// tree is alive at a time: two tree helpers and up to three results. Computing
+// all trees at once would need 10 helpers.
+TEST_F(QOracleToQCTest, ComparesWordsOneAtATime) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %c = memref.alloc() : memref<4x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb,
+                        %c : memref<4x!qc.qubit> as %vc)
+                   consumed(%y : !qc.qubit as %vy) {
+      %c5 = arith.constant 5 : i4
+      %c9 = arith.constant 9 : i4
+      %c3 = arith.constant 3 : i4
+      %eqA = arith.cmpi eq, %va, %c5 : i4
+      %eqB = arith.cmpi eq, %vb, %c9 : i4
+      %eqC = arith.cmpi eq, %vc, %c3 : i4
+      %ab = arith.andi %eqA, %eqB : i1
+      %f = arith.andi %ab, %eqC : i1
+      %next = arith.xori %vy, %f : i1
+      qoracle.yield %next : i1
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2],
+            in[3] ^
+                static_cast<uint64_t>(in[0] == 5 && in[1] == 9 && in[2] == 3)};
+  });
+  EXPECT_LE(countPeakHelpers(body), 5U);
+}
+
+// R6 undoes the steps in reverse order, so each helper register is 0 once the
+// inverse of its creation has run, and is freed then. When R6 recomputes the
+// first comparison, with its six tree helpers, the later registers are gone.
+TEST_F(QOracleToQCTest, FreesHelperRegistersDuringCleanup) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<8x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<8x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%y : !qc.qubit as %vy) {
+      %k = arith.constant 90 : i8
+      %c3 = arith.constant 3 : i3
+      %eq1 = arith.cmpi eq, %va, %k : i8
+      %s = arith.addi %vb, %vc : i3
+      %eq2 = arith.cmpi eq, %s, %c3 : i3
+      %f = arith.andi %eq1, %eq2 : i1
+      %next = arith.xori %vy, %f : i1
+      qoracle.yield %next : i1
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    const auto s = (in[1] + in[2]) & 7;
+    return {in[0], in[1], in[2],
+            in[3] ^ static_cast<uint64_t>(in[0] == 90 && s == 3)};
+  });
+  EXPECT_LE(countPeakHelpers(body), 7U);
 }
 
 TEST_F(QOracleToQCTest, RejectsOrderedComparison) {
