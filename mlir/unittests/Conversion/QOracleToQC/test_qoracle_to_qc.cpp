@@ -3428,3 +3428,133 @@ TEST_F(QOracleToQCTest, XorsPredicateIntoTargetQubit) {
                    return {in[0], in[1], in[2] ^ f};
                  });
 }
+
+// A predicate compares words with constants and XORs the result into a target
+// qubit. `a == 5` is the AND of the bits of `a`, with the bits where 5 has a 0
+// inverted: three Toffolis for 4 bits, and as many to uncompute.
+TEST_F(QOracleToQCTest, XorsComparisonWithConstantIntoTarget) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%y : !qc.qubit as %vy) {
+      %c5 = arith.constant 5 : i4
+      %eq = arith.cmpi eq, %va, %c5 : i4
+      %next = arith.xori %vy, %eq : i1
+      qoracle.yield %next : i1
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] ^ static_cast<uint64_t>(in[0] == 5)};
+  });
+  EXPECT_LE(countToffolis(body), 6U);
+  EXPECT_LE(countPeakHelpers(body), 3U);
+}
+
+// Comparing with 0 inverts every bit; comparing with all ones inverts none.
+TEST_F(QOracleToQCTest, ComparesWithZeroAndAllOnes) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    %z = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%y : !qc.qubit as %vy, %z : !qc.qubit as %vz) {
+      %c0 = arith.constant 0 : i4
+      %ones = arith.constant -1 : i4
+      %isZero = arith.cmpi eq, %va, %c0 : i4
+      %isOnes = arith.cmpi eq, %va, %ones : i4
+      %nextY = arith.xori %vy, %isZero : i1
+      %nextZ = arith.xori %vz, %isOnes : i1
+      qoracle.yield %nextY, %nextZ : i1, i1
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ static_cast<uint64_t>(in[0] == 0),
+                           in[2] ^ static_cast<uint64_t>(in[0] == 15)};
+                 });
+}
+
+// The predicate of several words is the AND of their comparisons.
+TEST_F(QOracleToQCTest, AndComparisonsOfTwoRegisters) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%y : !qc.qubit as %vy) {
+      %c5 = arith.constant 5 : i3
+      %c2 = arith.constant 2 : i3
+      %eqA = arith.cmpi eq, %va, %c5 : i3
+      %eqB = arith.cmpi eq, %vb, %c2 : i3
+      %f = arith.andi %eqA, %eqB : i1
+      %next = arith.xori %vy, %f : i1
+      qoracle.yield %next : i1
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1],
+            in[2] ^ static_cast<uint64_t>(in[0] == 5 && in[1] == 2)};
+  });
+  // Two comparisons of two Toffolis each and one AND, computed and undone.
+  EXPECT_LE(countToffolis(body), 10U);
+}
+
+// The compared word is computed first; its register is cleaned up afterwards.
+TEST_F(QOracleToQCTest, ComparesSumWithConstant) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%y : !qc.qubit as %vy) {
+      %c3 = arith.constant 3 : i3
+      %s = arith.addi %va, %vb : i3
+      %eq = arith.cmpi eq, %s, %c3 : i3
+      %next = arith.xori %vy, %eq : i1
+      qoracle.yield %next : i1
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   const auto sum = (in[0] + in[1]) & 7;
+                   return {in[0], in[1],
+                           in[2] ^ static_cast<uint64_t>(sum == 3)};
+                 });
+}
+
+// The shape of the ChaCha key-search predicate: a round with feed-forward, then
+// a comparison of the result with a constant.
+TEST_F(QOracleToQCTest, ComparesFeedForwardChainWithConstant) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %a0,
+                        %b : memref<4x!qc.qubit> as %b0)
+                   consumed(%y : !qc.qubit as %vy) {
+      %c6 = arith.constant 6 : i4
+      %a1 = arith.addi %a0, %b0 : i4
+      %t = arith.xori %b0, %a1 : i4
+      %fa = arith.addi %a1, %a0 : i4
+      %f = arith.xori %fa, %t : i4
+      %eq = arith.cmpi eq, %f, %c6 : i4
+      %next = arith.xori %vy, %eq : i1
+      qoracle.yield %next : i1
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   const auto a1 = (in[0] + in[1]) & 0xF;
+                   const auto f = ((a1 + in[0]) ^ (in[1] ^ a1)) & 0xF;
+                   return {in[0], in[1], in[2] ^ static_cast<uint64_t>(f == 6)};
+                 });
+}
+
+TEST_F(QOracleToQCTest, RejectsOrderedComparison) {
+  expectRejected(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%y : !qc.qubit as %vy) {
+      %c5 = arith.constant 5 : i4
+      %lt = arith.cmpi ult, %va, %c5 : i4
+      %next = arith.xori %vy, %lt : i1
+      qoracle.yield %next : i1
+    })mlir",
+                 "contains invalid operations");
+}
