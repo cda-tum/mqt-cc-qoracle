@@ -533,7 +533,8 @@ SetVector<Operation*> readers(Value value) {
 }
 
 bool needsRegister(Operation* op) {
-  if (isa<arith::ConstantOp, arith::ExtUIOp, arith::TruncIOp>(op)) {
+  if (isa<arith::ConstantOp, arith::ExtUIOp, arith::TruncIOp, arith::ShLIOp>(
+          op)) {
     return false;
   }
   if (succeeded(matchRotation(op)) || succeeded(matchShift(op))) {
@@ -544,10 +545,15 @@ bool needsRegister(Operation* op) {
   if (value.use_empty()) {
     return false;
   }
+  if (isa<arith::AddIOp>(op)) {
+    return true;
+  }
   auto reads = readers(value);
   if (reads.size() == 1 && reads[0]->getBlock() == op->getBlock()) {
-    // Can be computed as a temporary
-    return false;
+    // A single reader computes it as a temporary, unless that reader relabels
+    // it.
+    return succeeded(matchRotation(reads[0])) ||
+           succeeded(matchShift(reads[0]));
   }
   return true;
 }
@@ -595,6 +601,11 @@ void fuseXorTemporaries(SmallVector<Statement>& statements,
     auto& statement = statements[i];
     if (statement.kind != Statement::Kind::Temp ||
         statement.op != Statement::Op::Xor) {
+      continue;
+    }
+    if (llvm::any_of(statements, [&](auto& other) {
+          return &other != &statement && statement.target == other.target;
+        })) {
       continue;
     }
     BitVector readers(statements.size() - i - 1);
@@ -1134,12 +1145,34 @@ bool planCleanup(SmallVector<UpdateStep>& steps, OracleOp oracle,
   return true;
 }
 
+bool isReadByLaterStep(Operation* op, Value value,
+                       DenseMap<Value, Value>& containers) {
+  for (auto* user : value.getUsers()) {
+    auto* ancestor = op->getBlock()->findAncestorOpInBlock(*user);
+    if (!ancestor || ancestor == op) {
+      continue;
+    }
+    if (!ancestor->isBeforeInBlock(op)) {
+      return true;
+    }
+    if (ancestor->getNumResults() == 0 ||
+        containers.contains(ancestor->getResult(0))) {
+      continue;
+    }
+    if (isReadByLaterStep(op, ancestor->getResult(0), containers)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool canOverwrite(Operation* op, Value value,
                   DenseMap<Value, Value>& containers) {
   if (!containers.contains(value)) {
     return false;
   }
-  if (value.getParentBlock() != op->getBlock() || !isLastReader(op, value)) {
+  if (value.getParentBlock() != op->getBlock() || !isLastReader(op, value) ||
+      isReadByLaterStep(op, value, containers)) {
     return false;
   }
   return true;

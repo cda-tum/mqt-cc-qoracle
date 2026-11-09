@@ -44,6 +44,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -404,6 +405,31 @@ protected:
       }
     });
     return gates;
+  }
+
+  /// Lower `body` and return the largest number of helper qubits allocated at
+  /// once, with each loop body counted once.
+  [[nodiscard]] size_t countPeakHelpers(StringRef body) {
+    auto moduleOp = parseBody(body);
+    if (!moduleOp) {
+      ADD_FAILURE() << diagnostics;
+      return 0;
+    }
+    const auto inputs = countAllocations(*moduleOp);
+    if (!runPass(*moduleOp)) {
+      ADD_FAILURE() << diagnostics;
+      return 0;
+    }
+    size_t live = 0;
+    size_t peak = 0;
+    moduleOp->walk<WalkOrder::PreOrder>([&](Operation* op) {
+      if (isa<qc::AllocOp>(op)) {
+        peak = std::max(peak, ++live);
+      } else if (isa<qc::DeallocOp>(op)) {
+        --live;
+      }
+    });
+    return peak - inputs;
   }
 
   [[nodiscard]] static size_t countAllocations(ModuleOp moduleOp) {
@@ -1009,6 +1035,8 @@ TEST_F(QOracleToQCTest, RejectsTemporaryReadingTheOverwrittenValue) {
                  "a temporary depends on the value to be overwritten");
 }
 
+// The temporary `t` is evaluated in the step of `y1`, so it still reads `x`
+// after `x1`. Without reordering, `x1` cannot overwrite `x` in place.
 TEST_F(QOracleToQCTest, RejectsTemporaryReadingValueOverwrittenEarlier) {
   expectRejected(R"mlir(
     %k = qc.alloc : !qc.qubit
@@ -1021,7 +1049,7 @@ TEST_F(QOracleToQCTest, RejectsTemporaryReadingValueOverwrittenEarlier) {
       %y1 = arith.xori %vy, %t : i1
       qoracle.yield %x1, %y1 : i1, i1
     })mlir",
-                 "overwritten in a previous step");
+                 "yielded value 0 does not match");
 }
 
 TEST_F(QOracleToQCTest, LowersCapturedConstant) {
@@ -1525,7 +1553,8 @@ TEST_F(QOracleToQCTest, RejectsXorWithOwnRotation) {
                  "a temporary depends on the value to be overwritten");
 }
 
-// The rotation of `d` is read after `d` is overwritten.
+// The rotation of `d` is evaluated in the step of `nextR`, so it still reads
+// `d` after `nextD`. Without reordering, `nextD` cannot overwrite `d` in place.
 TEST_F(QOracleToQCTest, RejectsRotationOfValueOverwrittenEarlier) {
   expectRejected(R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
@@ -1543,7 +1572,7 @@ TEST_F(QOracleToQCTest, RejectsRotationOfValueOverwrittenEarlier) {
       %nextR = arith.xori %vr, %rot : i4
       qoracle.yield %nextD, %nextR : i4, i4
     })mlir",
-                 "overwritten in a previous step");
+                 "yielded value 0 does not match");
 }
 
 // A shift with a second user computes more than the rotation.
@@ -1953,6 +1982,29 @@ TEST_F(QOracleToQCTest, XorsInvertedXorWithoutHelpers) {
     return {in[0], in[1] ^ ~(rotl(in[0], 1, 4) ^ in[0])};
   });
   EXPECT_EQ(countHelpers(body), 0U);
+}
+
+// Both registers are read again after the sum, so neither can be borrowed and
+// the sum is a temporary. Its adder writes the copy of `a` in place, so that
+// copy is not a finished XOR and must not be fused into its reader.
+TEST_F(QOracleToQCTest, XorsTemporarySumOfRegistersReadLater) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %s = arith.addi %va, %vb : i4
+      %x = arith.xori %vr, %s : i4
+      %y = arith.xori %x, %va : i4
+      %next = arith.xori %y, %vb : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1],
+                           in[2] ^ (in[0] + in[1]) ^ in[0] ^ in[1]};
+                 });
 }
 
 // The pattern of SHA-256's h + S1(e). The adder reads its operand more than
@@ -3232,4 +3284,147 @@ TEST_F(QOracleToQCTest, RejectsProgramWithStaticQubits) {
       qoracle.yield %next : i1
     })mlir",
                  "in a program with static qubits");
+}
+
+// An XOR target is a consumed register yielded as `y ^ f(x)`: every
+// intermediate value of `f` must be cleaned up. The programs below compute `f`
+// from kept registers that are read again at the end, as in ChaCha's
+// feed-forward, so no input can be borrowed.
+
+namespace {
+/// `rounds` rounds of `a += b; b = rotl(b ^ a, 1)` on kept 4-bit `a` and `b`,
+/// then `y ^= (a + a0) ^ (b ^ b0)` with the inputs `a0` and `b0`.
+std::string feedForwardBody(unsigned rounds) {
+  std::string body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %y = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %a0,
+                        %b : memref<4x!qc.qubit> as %b0)
+                   consumed(%y : memref<4x!qc.qubit> as %vy) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+)mlir";
+  for (unsigned i = 0; i < rounds; ++i) {
+    const auto a = "%a" + std::to_string(i);
+    const auto b = "%b" + std::to_string(i);
+    const auto next = std::to_string(i + 1);
+    const auto t = "%t" + std::to_string(i);
+    body += "      %a" + next + " = arith.addi " + a + ", " + b + " : i4\n";
+    body += "      " + t + " = arith.xori " + b + ", %a" + next + " : i4\n";
+    body += "      %hi" + next + " = arith.shli " + t + ", %c1 : i4\n";
+    body += "      %lo" + next + " = arith.shrui " + t + ", %c3 : i4\n";
+    body += "      %b" + next + " = arith.ori %hi" + next + ", %lo" + next +
+            " : i4\n";
+  }
+  const auto last = std::to_string(rounds);
+  body += "      %fa = arith.addi %a" + last + ", %a0 : i4\n";
+  body += "      %fb = arith.xori %b" + last + ", %b0 : i4\n";
+  body += R"mlir(      %f = arith.xori %fa, %fb : i4
+      %next = arith.xori %vy, %f : i4
+      qoracle.yield %next : i4
+    })mlir";
+  return body;
+}
+
+RegisterValues feedForward(ArrayRef<uint64_t> in, unsigned rounds) {
+  uint64_t a = in[0];
+  uint64_t b = in[1];
+  for (unsigned i = 0; i < rounds; ++i) {
+    a = (a + b) & 0xF;
+    b = rotl(b ^ a, 1, 4);
+  }
+  return {in[0], in[1], in[2] ^ ((a + in[0]) ^ b ^ in[1])};
+}
+
+/// `rounds` rounds of `x = rotl((x + m1) ^ m2, 1)` from the constant `x = 5`,
+/// with kept `m1` and `m2`, then `y ^= x + 5`: the state chain never runs in an
+/// input's qubits, as in a hash that starts from its IV.
+std::string fromConstantBody(unsigned rounds) {
+  std::string body = R"mlir(
+    %m1 = memref.alloc() : memref<4x!qc.qubit>
+    %m2 = memref.alloc() : memref<4x!qc.qubit>
+    %y = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%m1 : memref<4x!qc.qubit> as %vm1,
+                        %m2 : memref<4x!qc.qubit> as %vm2)
+                   consumed(%y : memref<4x!qc.qubit> as %vy) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %x0 = arith.constant 5 : i4
+)mlir";
+  for (unsigned i = 0; i < rounds; ++i) {
+    const auto x = "%x" + std::to_string(i);
+    const auto n = std::to_string(i + 1);
+    body += "      %s" + n + " = arith.addi " + x + ", %vm1 : i4\n";
+    body += "      %t" + n + " = arith.xori %s" + n + ", %vm2 : i4\n";
+    body += "      %hi" + n + " = arith.shli %t" + n + ", %c1 : i4\n";
+    body += "      %lo" + n + " = arith.shrui %t" + n + ", %c3 : i4\n";
+    body += "      %x" + n + " = arith.ori %hi" + n + ", %lo" + n + " : i4\n";
+  }
+  body += "      %f = arith.addi %x" + std::to_string(rounds) + ", %x0 : i4\n";
+  body += R"mlir(      %next = arith.xori %vy, %f : i4
+      qoracle.yield %next : i4
+    })mlir";
+  return body;
+}
+
+RegisterValues fromConstant(ArrayRef<uint64_t> in, unsigned rounds) {
+  uint64_t x = 5;
+  for (unsigned i = 0; i < rounds; ++i) {
+    x = rotl(((x + in[0]) & 0xF) ^ in[1], 1, 4);
+  }
+  return {in[0], in[1], in[2] ^ (x + 5)};
+}
+} // namespace
+
+TEST_F(QOracleToQCTest, XorsFeedForwardChainIntoTarget) {
+  expectLowersTo(feedForwardBody(1),
+                 [](ArrayRef<uint64_t> in) { return feedForward(in, 1); });
+}
+
+// The state words are updated in place in helper registers, so more rounds
+// cost more gates but no more qubits. The prototype needs 15 helpers.
+TEST_F(QOracleToQCTest, KeepsHelpersConstantAcrossRounds) {
+  expectLowersTo(feedForwardBody(3),
+                 [](ArrayRef<uint64_t> in) { return feedForward(in, 3); });
+  const auto oneRound = countPeakHelpers(feedForwardBody(1));
+  const auto threeRounds = countPeakHelpers(feedForwardBody(3));
+  EXPECT_EQ(threeRounds, oneRound);
+  EXPECT_LE(threeRounds, 15U);
+}
+
+// A chain that starts at a constant runs in one helper register. The
+// prototype needs 7 helpers.
+TEST_F(QOracleToQCTest, ComputesChainFromConstantInOneRegister) {
+  expectLowersTo(fromConstantBody(3),
+                 [](ArrayRef<uint64_t> in) { return fromConstant(in, 3); });
+  // With one round, `m1` and `m2` are read once and can be borrowed instead.
+  const auto twoRounds = countPeakHelpers(fromConstantBody(2));
+  const auto threeRounds = countPeakHelpers(fromConstantBody(3));
+  EXPECT_EQ(threeRounds, twoRounds);
+  EXPECT_LE(threeRounds, 7U);
+}
+
+// A predicate oracle: one bit of `f` is XORed into a single target qubit.
+TEST_F(QOracleToQCTest, XorsPredicateIntoTargetQubit) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %y = qc.alloc : !qc.qubit
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %a0,
+                        %b : memref<4x!qc.qubit> as %b0)
+                   consumed(%y : !qc.qubit as %vy) {
+      %a1 = arith.addi %a0, %b0 : i4
+      %t = arith.xori %b0, %a1 : i4
+      %fa = arith.addi %a1, %a0 : i4
+      %f = arith.xori %fa, %t : i4
+      %bit = arith.trunci %f : i4 to i1
+      %next = arith.xori %vy, %bit : i1
+      qoracle.yield %next : i1
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   const auto a1 = (in[0] + in[1]) & 0xF;
+                   const auto f = ((a1 + in[0]) ^ (in[1] ^ a1)) & 1;
+                   return {in[0], in[1], in[2] ^ f};
+                 });
 }
