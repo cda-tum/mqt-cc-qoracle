@@ -589,6 +589,45 @@ void dropZeroBits(SmallVector<Statement>& statements) {
   statements = result;
 }
 
+void fuseXorTemporaries(SmallVector<Statement>& statements,
+                        HelperAllocator& allocator) {
+  for (size_t i = 0; i < statements.size(); ++i) {
+    auto& statement = statements[i];
+    if (statement.kind != Statement::Kind::Temp ||
+        statement.op != Statement::Op::Xor) {
+      continue;
+    }
+    BitVector readers(statements.size() - i - 1);
+    bool found = false;
+    for (size_t j = i + 1; j < statements.size(); ++j) {
+      auto& reader = statements[j];
+      if (!llvm::is_contained(reader.operands, statement.target)) {
+        if (!found && llvm::is_contained(statement.operands, reader.target)) {
+          break;
+        }
+        continue;
+      }
+      found = true;
+      readers[j - i - 1] = true;
+    }
+    if (readers.count() != 1) {
+      continue;
+    }
+    auto& user = statements[i + 1 + readers.find_first()];
+    if (user.op != Statement::Op::Xor ||
+        llvm::count(user.operands, statement.target) != 1) {
+      continue;
+    }
+
+    llvm::erase(user.operands, statement.target);
+    user.operands.append(statement.operands.begin(), statement.operands.end());
+    user.invert ^= statement.invert;
+    allocator.discard(statement.target);
+    statements.erase(statements.begin() + i);
+    --i;
+  }
+}
+
 SmallVector<Statement>
 buildStatements(const UpdateStep& update,
                 DenseMap<Value, SmallVector<Value>>& storageMap,
@@ -649,6 +688,7 @@ buildStatements(const UpdateStep& update,
     llvm_unreachable("Unexpected update operation");
   }
   dropZeroBits(statements);
+  fuseXorTemporaries(statements, allocator);
   return statements;
 }
 
@@ -686,9 +726,12 @@ void emitStatement(const Statement& statement, Location loc,
   } else if (statement.op == Statement::Op::Or) {
     auto x = statement.operands[0];
     auto y = statement.operands[1];
+    emitGate(loc, {}, x, rewriter);
+    emitGate(loc, {}, y, rewriter);
     emitGate(loc, {x, y}, statement.target, rewriter);
-    emitGate(loc, {x}, statement.target, rewriter);
-    emitGate(loc, {y}, statement.target, rewriter);
+    emitGate(loc, {}, x, rewriter);
+    emitGate(loc, {}, y, rewriter);
+    emitGate(loc, {}, statement.target, rewriter);
   }
 }
 
