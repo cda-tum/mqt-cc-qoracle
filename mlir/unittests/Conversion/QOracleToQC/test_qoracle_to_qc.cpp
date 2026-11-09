@@ -382,18 +382,28 @@ protected:
   /// Lower `body` and return the number of Toffoli gates in the circuit, with
   /// each loop body counted once.
   [[nodiscard]] size_t countToffolis(StringRef body) {
+    return countControlledX(body, 2);
+  }
+
+  /// Lower `body` and return the number of CNOT gates in the circuit, with
+  /// each loop body counted once.
+  [[nodiscard]] size_t countCnots(StringRef body) {
+    return countControlledX(body, 1);
+  }
+
+  [[nodiscard]] size_t countControlledX(StringRef body, size_t controls) {
     auto moduleOp = parseBody(body);
     if (!moduleOp || !runPass(*moduleOp)) {
       ADD_FAILURE() << diagnostics;
       return 0;
     }
-    size_t toffolis = 0;
+    size_t gates = 0;
     moduleOp->walk([&](qc::CtrlOp ctrl) {
-      if (ctrl.getNumControls() == 2) {
-        ++toffolis;
+      if (ctrl.getNumControls() == controls) {
+        ++gates;
       }
     });
-    return toffolis;
+    return gates;
   }
 
   [[nodiscard]] static size_t countAllocations(ModuleOp moduleOp) {
@@ -1810,6 +1820,7 @@ TEST_F(QOracleToQCTest, AndInvertedKeptRegister) {
   EXPECT_EQ(countHelpers(body), 4U);
 }
 
+// The NOT folds into the update, so only the AND needs helpers.
 TEST_F(QOracleToQCTest, XorsNandOfKeptRegisters) {
   constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
@@ -1827,6 +1838,7 @@ TEST_F(QOracleToQCTest, XorsNandOfKeptRegisters) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1], in[2] ^ ~(in[0] & in[1])};
   });
+  EXPECT_EQ(countHelpers(body), 4U);
 }
 
 // r + ~a = r - a - 1, so the carries must see the inverted bits.
@@ -1848,6 +1860,7 @@ TEST_F(QOracleToQCTest, AddsInvertedKeptRegister) {
 }
 
 // The top bit of `a >> 1` is known to be 0, so the top bit of its inverse is 1.
+// The inverse folds into the update, so no helpers are needed.
 TEST_F(QOracleToQCTest, XorsInvertedShift) {
   constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
@@ -1864,6 +1877,7 @@ TEST_F(QOracleToQCTest, XorsInvertedShift) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1] ^ ~(in[0] >> 1)};
   });
+  EXPECT_EQ(countHelpers(body), 0U);
 }
 
 // A NOT of a kept register goes straight into the `zero` register: CNOTs, then
@@ -1884,8 +1898,95 @@ TEST_F(QOracleToQCTest, CreatesInvertedKeptRegisterInZeroRegister) {
   EXPECT_EQ(countHelpers(body), 0U);
 }
 
-// OR is computed as `t ^= x ^ y ^ (x & y)`: one Toffoli per bit, and one more
-// to uncompute the temporary.
+// The form of SHA-256's sigma functions. A chain of XORs is one XOR of all its
+// operands, so the update needs no helpers: one CNOT per operand bit, and none
+// for the known-0 top bit of the shift. All operands read `a`, so borrowing
+// `a` is impossible.
+TEST_F(QOracleToQCTest, XorsRotationsAndShiftWithoutHelpers) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c2 = arith.constant 2 : i4
+      %c3 = arith.constant 3 : i4
+      %hi1 = arith.shli %va, %c1 : i4
+      %lo1 = arith.shrui %va, %c3 : i4
+      %rot1 = arith.ori %hi1, %lo1 : i4
+      %hi2 = arith.shli %va, %c2 : i4
+      %lo2 = arith.shrui %va, %c2 : i4
+      %rot2 = arith.ori %hi2, %lo2 : i4
+      %sh = arith.shrui %va, %c1 : i4
+      %x = arith.xori %rot1, %rot2 : i4
+      %sigma = arith.xori %x, %sh : i4
+      %next = arith.xori %vr, %sigma : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0],
+            in[1] ^ rotl(in[0], 1, 4) ^ rotl(in[0], 2, 4) ^ (in[0] >> 1)};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_EQ(countCnots(body), 11U);
+}
+
+// The NOT of a XOR folds in as well: r ^= rotl(a, 1) ^ a, then X gates on `r`.
+TEST_F(QOracleToQCTest, XorsInvertedXorWithoutHelpers) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c3 = arith.constant 3 : i4
+      %ones = arith.constant -1 : i4
+      %hi = arith.shli %va, %c1 : i4
+      %lo = arith.shrui %va, %c3 : i4
+      %rot = arith.ori %hi, %lo : i4
+      %x = arith.xori %rot, %va : i4
+      %nx = arith.xori %x, %ones : i4
+      %next = arith.xori %vr, %nx : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1] ^ ~(rotl(in[0], 1, 4) ^ in[0])};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+}
+
+// The pattern of SHA-256's h + S1(e). The adder reads its operand more than
+// once, so the XOR chain needs a temporary for each bit but the top one, which
+// only the top sum bit reads. One more helper holds a carry.
+TEST_F(QOracleToQCTest, AddsSigmaWithOneTemporary) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c1 = arith.constant 1 : i4
+      %c2 = arith.constant 2 : i4
+      %c3 = arith.constant 3 : i4
+      %hi1 = arith.shli %va, %c1 : i4
+      %lo1 = arith.shrui %va, %c3 : i4
+      %rot1 = arith.ori %hi1, %lo1 : i4
+      %hi2 = arith.shli %va, %c2 : i4
+      %lo2 = arith.shrui %va, %c2 : i4
+      %rot2 = arith.ori %hi2, %lo2 : i4
+      %sh = arith.shrui %va, %c1 : i4
+      %x = arith.xori %rot1, %rot2 : i4
+      %sigma = arith.xori %x, %sh : i4
+      %next = arith.addi %vr, %sigma : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0],
+            in[1] + (rotl(in[0], 1, 4) ^ rotl(in[0], 2, 4) ^ (in[0] >> 1))};
+  });
+  EXPECT_EQ(countHelpers(body), 4U);
+}
+
+// OR needs one Toffoli per bit, and one more to uncompute the temporary.
 TEST_F(QOracleToQCTest, XorsOrOfKeptRegisters) {
   constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
@@ -1945,7 +2046,8 @@ TEST_F(QOracleToQCTest, AddsOrOfKeptRegisters) {
                  });
 }
 
-// A `zero` register starts at 0, so the OR is computed straight into it.
+// A `zero` register starts at 0, so the OR is computed straight into it. As
+// t ^= ~(~a & ~b), it needs one Toffoli per bit and X gates, but no CNOTs.
 TEST_F(QOracleToQCTest, CreatesOrInZeroRegister) {
   constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
@@ -1962,6 +2064,7 @@ TEST_F(QOracleToQCTest, CreatesOrInZeroRegister) {
   });
   EXPECT_EQ(countHelpers(body), 0U);
   EXPECT_EQ(countToffolis(body), 4U);
+  EXPECT_EQ(countCnots(body), 0U);
 }
 
 // The top bit of `a >> 1` is known to be 0, so the top bit of the OR is `b3`.
