@@ -1509,6 +1509,10 @@ Value chainInput(Operation* op, OracleOp oracle) {
     return nullptr;
   }
   for (auto input : getTemporaryInputs(op)) {
+    if (input.getDefiningOp<arith::ExtUIOp>() ||
+        input.getDefiningOp<arith::TruncIOp>()) {
+      continue;
+    }
     if (input.getParentBlock() == op->getBlock() &&
         !oracle.isKeptAlias(input) && !isFolded(op, input) &&
         isLastReader(op, input)) {

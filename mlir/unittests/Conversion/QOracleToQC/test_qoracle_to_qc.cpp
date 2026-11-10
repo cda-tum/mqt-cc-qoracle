@@ -3625,6 +3625,29 @@ TEST_F(QOracleToQCTest, FreesHelperRegistersDuringCleanup) {
   EXPECT_LE(countPeakHelpers(body), 7U);
 }
 
+// An addition with carry-out: the operands are zero-extended, and the sum is
+// created in the wider `zero` register. An extension cannot be updated in
+// place, so the creation starts at the addition: a copy of `a`, then `b` added
+// in place, with one carry helper.
+TEST_F(QOracleToQCTest, CreatesSumWithCarryOutInZeroRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %s = memref.alloc() : memref<5x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(zero %s : memref<5x!qc.qubit> as %vs) {
+      %ea = arith.extui %va : i4 to i5
+      %eb = arith.extui %vb : i4 to i5
+      %sum = arith.addi %ea, %eb : i5
+      qoracle.yield %sum : i5
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[0] + in[1]};
+  });
+  EXPECT_LE(countToffolis(body), 8U);
+}
+
 TEST_F(QOracleToQCTest, RejectsOrderedComparison) {
   expectRejected(R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
