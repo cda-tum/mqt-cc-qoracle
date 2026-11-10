@@ -89,23 +89,37 @@ struct HelperAllocator {
   Operation* outerLoop;
   Location loc;
   PatternRewriter& rewriter;
+  SmallVector<Value>& loopHelpers;
+  SmallVector<Value> free;
   SmallVector<Value> allocated;
 
+  void init() {
+    if (outerLoop != nullptr) {
+      free.assign(loopHelpers.begin(), loopHelpers.end());
+    }
+  }
+
   Value allocate() {
+    if (outerLoop != nullptr && !free.empty()) {
+      auto helper = free.pop_back_val();
+      allocated.push_back(helper);
+      return helper;
+    }
     OpBuilder::InsertionGuard guard(rewriter);
     if (outerLoop != nullptr) {
       rewriter.setInsertionPoint(outerLoop);
     }
     auto qubit = qc::AllocOp::create(rewriter, loc);
 
+    if (outerLoop != nullptr) {
+      loopHelpers.push_back(qubit);
+    }
     allocated.push_back(qubit);
     return qubit;
   }
 
-  void release(SmallVector<Value>& container) {
-    if (outerLoop != nullptr) {
-      llvm::append_range(container, allocated);
-    } else {
+  void release() {
+    if (outerLoop == nullptr) {
       for (auto qubit : allocated) {
         qc::DeallocOp::create(rewriter, loc, qubit);
       }
@@ -114,6 +128,13 @@ struct HelperAllocator {
 
   void discard(Value qubit) {
     llvm::erase(allocated, qubit);
+    if (outerLoop != nullptr && !qubit.use_empty()) {
+      free.push_back(qubit);
+      return;
+    }
+    if (outerLoop != nullptr) {
+      llvm::erase(loopHelpers, qubit);
+    }
     rewriter.eraseOp(qubit.getDefiningOp());
   }
 };
@@ -1039,8 +1060,11 @@ void emitUpdateStep(const UpdateStep& step,
     return;
   }
 
-  HelperAllocator allocator{
-      .outerLoop = outerLoop, .loc = loc, .rewriter = rewriter};
+  HelperAllocator allocator{.outerLoop = outerLoop,
+                            .loc = loc,
+                            .rewriter = rewriter,
+                            .loopHelpers = loopHelpers};
+  allocator.init();
 
   for (auto* temporary : step.temporaries) {
     auto temporaryBits = relabel(temporary, storageMap);
@@ -1095,7 +1119,7 @@ void emitUpdateStep(const UpdateStep& step,
   auto qubits = storageMap.at(step.overwriteValue);
   storageMap[step.updateOp->getResult(0)] = qubits;
 
-  allocator.release(loopHelpers);
+  allocator.release();
 }
 
 void emitInverseStep(const UpdateStep& step,

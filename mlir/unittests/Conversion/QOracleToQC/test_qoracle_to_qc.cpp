@@ -3661,3 +3661,71 @@ TEST_F(QOracleToQCTest, RejectsOrderedComparison) {
     })mlir",
                  "contains invalid operations");
 }
+
+// Helpers of steps inside a loop are allocated before the loop. Each step
+// leaves its helpers at 0, so the steps of one body share them: three
+// additions need one carry helper, not three.
+TEST_F(QOracleToQCTest, ReusesCarryHelpersInsideLoop) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    %e = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va)
+                   consumed(%d : memref<4x!qc.qubit> as %vd,
+                            %e : memref<4x!qc.qubit> as %ve) {
+      %c0 = arith.constant 0 : index
+      %one = arith.constant 1 : index
+      %two = arith.constant 2 : index
+      %out:2 = scf.for %i = %c0 to %two step %one
+          iter_args(%x = %vd, %y = %ve) -> (i4, i4) {
+        %x1 = arith.addi %x, %va : i4
+        %y1 = arith.addi %y, %x1 : i4
+        %x2 = arith.addi %x1, %y1 : i4
+        scf.yield %x2, %y1 : i4, i4
+      }
+      qoracle.yield %out#0, %out#1 : i4, i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    uint64_t x = in[1];
+    uint64_t y = in[2];
+    for (int i = 0; i < 2; ++i) {
+      x = (x + in[0]) & 0xF;
+      y = (y + x) & 0xF;
+      x = (x + y) & 0xF;
+    }
+    return {in[0], x, y};
+  });
+  EXPECT_EQ(countPeakHelpers(body), 1U);
+}
+
+// Steps with different numbers of helpers share them as well: the first step
+// needs four for the AND and one carry, the second step reuses that carry.
+TEST_F(QOracleToQCTest, SharesHelpersOfDifferentStepsInsideLoop) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %d = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%d : memref<4x!qc.qubit> as %vd) {
+      %c0 = arith.constant 0 : index
+      %one = arith.constant 1 : index
+      %two = arith.constant 2 : index
+      %out = scf.for %i = %c0 to %two step %one
+          iter_args(%x = %vd) -> (i4) {
+        %ab = arith.andi %va, %vb : i4
+        %x1 = arith.addi %x, %ab : i4
+        %x2 = arith.addi %x1, %va : i4
+        scf.yield %x2 : i4
+      }
+      qoracle.yield %out : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    uint64_t x = in[2];
+    for (int i = 0; i < 2; ++i) {
+      x = (x + (in[0] & in[1]) + in[0]) & 0xF;
+    }
+    return {in[0], in[1], x};
+  });
+  EXPECT_LE(countPeakHelpers(body), 5U);
+}
