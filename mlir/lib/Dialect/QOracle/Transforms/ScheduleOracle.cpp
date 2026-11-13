@@ -86,11 +86,9 @@ bool mustWait(Operation* op, OracleOp oracle, ArrayRef<Operation*> unplaced) {
     auto readByUnplaced = llvm::any_of(unplaced, [&](Operation* other) {
       return other != op && llvm::is_contained(getNestedOperands(other), value);
     });
-    // A use by the terminator or outside the block follows every operation
-    // that is scheduled here.
     auto readLater = llvm::any_of(value.getUsers(), [&](Operation* user) {
       auto* ancestor = block->findAncestorOpInBlock(*user);
-      return ancestor == nullptr || ancestor == block->getTerminator();
+      return ancestor != nullptr || ancestor == block->getTerminator();
     });
     return readByUnplaced || readLater;
   };

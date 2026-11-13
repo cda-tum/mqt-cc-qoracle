@@ -812,12 +812,20 @@ void dropZeroBits(SmallVector<Statement>& statements) {
   statements = result;
 }
 
-void fuseXorTemporaries(SmallVector<Statement>& statements,
-                        HelperAllocator& allocator) {
+/// Compute each temporary that a single XOR reads directly into that XOR's
+/// target, without helper qubits.
+///
+/// Every statement XORs a function of its operands into its target, so the
+/// temporary can move to its reader as long as its operands keep their values
+/// until then. With `xors`, only XOR temporaries are fused, by merging their
+/// operands into the reader. Otherwise only AND, OR, and majority temporaries
+/// are fused, as statements of their own on the reader's target.
+void fuseTemporaries(SmallVector<Statement>& statements,
+                     HelperAllocator& allocator, bool xors) {
   for (size_t i = 0; i < statements.size(); ++i) {
     auto& statement = statements[i];
     if (statement.kind != Statement::Kind::Temp ||
-        statement.op != Statement::Op::Xor) {
+        (statement.op == Statement::Op::Xor) != xors) {
       continue;
     }
     if (llvm::any_of(statements, [&](auto& other) {
@@ -841,16 +849,30 @@ void fuseXorTemporaries(SmallVector<Statement>& statements,
     if (readers.count() != 1) {
       continue;
     }
-    auto& user = statements[i + 1 + readers.find_first()];
+    auto userIndex = i + 1 + readers.find_first();
+    auto& user = statements[userIndex];
     if (user.op != Statement::Op::Xor ||
-        llvm::count(user.operands, statement.target) != 1) {
+        llvm::count(user.operands, statement.target) != 1 ||
+        llvm::is_contained(statement.operands, user.target)) {
       continue;
     }
 
     llvm::erase(user.operands, statement.target);
-    user.operands.append(statement.operands.begin(), statement.operands.end());
-    user.invert ^= statement.invert;
-    allocator.discard(statement.target);
+    if (xors) {
+      user.operands.append(statement.operands.begin(),
+                           statement.operands.end());
+      user.invert ^= statement.invert;
+    } else {
+      auto fused = statement;
+      fused.kind = user.kind;
+      fused.target = user.target;
+      if (user.operands.empty() && !user.invert) {
+        statements[userIndex] = std::move(fused);
+      } else {
+        statements.insert(statements.begin() + userIndex, std::move(fused));
+      }
+    }
+    allocator.discard(statements[i].target);
     statements.erase(statements.begin() + i);
     --i;
   }
@@ -916,7 +938,10 @@ buildStatements(const UpdateStep& update,
     llvm_unreachable("Unexpected update operation");
   }
   dropZeroBits(statements);
-  fuseXorTemporaries(statements, allocator);
+  // XOR temporaries go first: merging one into its reader turns the ANDs it
+  // reads into operands of that reader, which can then be fused as well.
+  fuseTemporaries(statements, allocator, /*xors=*/true);
+  fuseTemporaries(statements, allocator, /*xors=*/false);
   return statements;
 }
 
@@ -1419,9 +1444,17 @@ std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
     return {nullptr, nullptr};
   }
 
+  // An XOR temporary whose only reader is an XOR is computed directly into
+  // that reader's target, which is cheaper than computing and restoring it in
+  // a borrowed register.
+  auto reads = readers(op->getResult(0));
+  auto fusedIntoReader = isa<arith::XOrIOp>(op) && reads.size() == 1 &&
+                         isa<arith::XOrIOp>(reads[0]) &&
+                         reads[0]->getBlock() == op->getBlock();
+
   size_t overwriteIndex = 2;
   for (bool kept : {false, true}) {
-    if (overwriteIndex < 2 || (kept && !allowBorrowing)) {
+    if (overwriteIndex < 2 || (kept && (!allowBorrowing || fusedIntoReader))) {
       break;
     }
     for (auto [i, value] : llvm::enumerate(op->getOperands())) {

@@ -1897,7 +1897,7 @@ TEST_F(QOracleToQCTest, AndInvertedKeptRegister) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1], in[2] ^ (~in[0] & in[1])};
   });
-  EXPECT_EQ(countHelpers(body), 4U);
+  EXPECT_EQ(countHelpers(body), 0U);
 }
 
 // The NOT folds into the update, so only the AND needs helpers.
@@ -2926,8 +2926,8 @@ TEST_F(QOracleToQCTest, ReadsHelperRegisterInTemporary) {
     auto t = in[0] & in[1];
     return {in[0], in[1], in[2], in[3] ^ t, in[4] ^ (t & in[2])};
   });
-  // `%t` once and its cleanup, plus `%u` and its cleanup.
-  EXPECT_EQ(countToffolis(body), 8U);
+  // `%t` once and its cleanup, plus `%u` straight into `y`.
+  EXPECT_EQ(countToffolis(body), 6U);
 }
 
 // R6 undoes the creation of `%t` before it restores the borrowed `a`, because
@@ -2958,7 +2958,8 @@ TEST_F(QOracleToQCTest, CleansUpHelperRegisterBeforeBorrowedRegister) {
 }
 
 // Cleaning up `%t` would need the old value of `x`, which `%x1` overwrites. The
-// pass falls back to recomputing `%t` in each step and reports nothing.
+// pass falls back to recomputing `%t` straight into `y` and `z` and reports
+// nothing; a helper register for `%t` would need two helpers.
 TEST_F(QOracleToQCTest, FallsBackToTemporariesWhenCleanupIsIllegal) {
   constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<2x!qc.qubit>
@@ -2980,7 +2981,7 @@ TEST_F(QOracleToQCTest, FallsBackToTemporariesWhenCleanupIsIllegal) {
     return {in[0], in[1] ^ in[0], in[2] ^ t, in[3] ^ t};
   });
   EXPECT_EQ(diagnostics, "");
-  EXPECT_EQ(countToffolis(body), 8U);
+  EXPECT_EQ(countHelpers(body), 0U);
 }
 
 // Inverting a loop is not supported, so R6 cannot clean up a helper register
@@ -4016,5 +4017,109 @@ TEST_F(QOracleToQCTest, XorsSharedAndIntoTwoRegisters) {
                  [](ArrayRef<uint64_t> in) -> RegisterValues {
                    return {in[0], in[1], in[2] ^ (in[0] & in[1]),
                            in[3] ^ (in[0] & in[1])};
+                 });
+}
+
+// `%t` reads the old `c`, but its reader `%tc` needs the new one, and `%c1`
+// must end in `c`. `%t` gets a helper register; its cleanup undoes `%c1`,
+// uncomputes `%t`, and redoes `%c1`. `%c1` needs no register of its own.
+TEST_F(QOracleToQCTest, RollsBackOverwriteToCleanUpHelperRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %d = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%c : memref<3x!qc.qubit> as %vc,
+                            %d : memref<3x!qc.qubit> as %vd) {
+      %t = arith.andi %va, %vc : i3
+      %c1 = arith.xori %vc, %vb : i3
+      %tc = arith.andi %t, %c1 : i3
+      %d1 = arith.xori %vd, %tc : i3
+      qoracle.yield %c1, %d1 : i3, i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto c1 = in[2] ^ in[1];
+    return {in[0], in[1], c1, in[3] ^ (in[0] & in[2] & c1)};
+  });
+  // `%t`, `%tc` straight into `d`, and the cleanup of `%t`.
+  EXPECT_LE(countPeakHelpers(body), 3U);
+  EXPECT_LE(countToffolis(body), 9U);
+}
+
+// Undoing an addition subtracts, so the rollback needs the carries again.
+TEST_F(QOracleToQCTest, RollsBackAdditionToCleanUpHelperRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %d = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%c : memref<3x!qc.qubit> as %vc,
+                            %d : memref<3x!qc.qubit> as %vd) {
+      %t = arith.andi %va, %vc : i3
+      %c1 = arith.addi %vc, %vb : i3
+      %tc = arith.andi %t, %c1 : i3
+      %d1 = arith.xori %vd, %tc : i3
+      qoracle.yield %c1, %d1 : i3, i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto c1 = (in[2] + in[1]) & 7U;
+    return {in[0], in[1], c1, in[3] ^ (in[0] & in[2] & c1)};
+  });
+  // The register of `%t` and the two carries of the addition.
+  EXPECT_LE(countPeakHelpers(body), 5U);
+}
+
+// Two steps change `c` after `%t` reads it, so the cleanup undoes both, the
+// later one first, and redoes them in program order.
+TEST_F(QOracleToQCTest, RollsBackSeveralOverwritesInReverseOrder) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %d = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%c : memref<3x!qc.qubit> as %vc,
+                            %d : memref<3x!qc.qubit> as %vd) {
+      %t = arith.andi %va, %vc : i3
+      %c1 = arith.xori %vc, %vb : i3
+      %c2 = arith.addi %c1, %va : i3
+      %tc = arith.andi %t, %c2 : i3
+      %d1 = arith.xori %vd, %tc : i3
+      qoracle.yield %c2, %d1 : i3, i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   auto c2 = ((in[2] ^ in[1]) + in[0]) & 7U;
+                   return {in[0], in[1], c2, in[3] ^ (in[0] & in[2] & c2)};
+                 });
+}
+
+// Undoing `%c1` reads the old `b`, which `%b1` overwrites later, so the cleanup
+// of `%t` undoes `%b1` before `%c1`.
+TEST_F(QOracleToQCTest, RollsBackOverwriteThatRollbackReads) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %d = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(%b : memref<3x!qc.qubit> as %vb,
+                            %c : memref<3x!qc.qubit> as %vc,
+                            %d : memref<3x!qc.qubit> as %vd) {
+      %t = arith.andi %va, %vc : i3
+      %c1 = arith.xori %vc, %vb : i3
+      %tc = arith.andi %t, %c1 : i3
+      %d1 = arith.xori %vd, %tc : i3
+      %b1 = arith.xori %vb, %va : i3
+      qoracle.yield %b1, %c1, %d1 : i3, i3, i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   auto c1 = in[2] ^ in[1];
+                   return {in[0], in[1] ^ in[0], c1,
+                           in[3] ^ (in[0] & in[2] & c1)};
                  });
 }
