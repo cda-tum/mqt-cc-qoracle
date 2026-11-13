@@ -24,6 +24,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -154,6 +155,102 @@ struct Majority {
   Value y;
   Value z;
 };
+
+bool isClassical(Value value);
+
+bool isClassical(Operation* op) {
+  return isa<arith::ArithDialect, tensor::TensorDialect>(op->getDialect()) &&
+         llvm::all_of(op->getOperands(),
+                      [](Value v) { return isClassical(v); });
+}
+
+bool isClassical(Value value) {
+  if (!value) {
+    return false;
+  }
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+    return forOp && value == forOp.getInductionVar();
+  }
+  return isClassical(value.getDefiningOp());
+}
+
+bool isPerIterationConstant(Value value) {
+  return isClassical(value) && !matchPattern(value, m_Constant());
+}
+
+FailureOr<APInt> constantBits(Value value) {
+  APInt bits;
+  if (matchPattern(value, m_ConstantInt(&bits))) {
+    return bits;
+  }
+  return failure();
+}
+
+/// Return `value` cloned at the insertion point, cloning the classical ops
+/// that compute it first.
+Value materializeValue(Value value, IRMapping& mapping,
+                       DenseMap<Value, SmallVector<Value>>& storageMap,
+                       PatternRewriter& rewriter) {
+  if (auto mapped = mapping.lookupOrNull(value)) {
+    return mapped;
+  }
+  if (isa<BlockArgument>(value)) {
+    // An induction variable, mapped to the new loop's by emitForLoop.
+    return storageMap.at(value).front();
+  }
+  auto* defOp = value.getDefiningOp();
+  for (auto operand : defOp->getOperands()) {
+    mapping.map(operand,
+                materializeValue(operand, mapping, storageMap, rewriter));
+  }
+  rewriter.clone(*defOp, mapping);
+  return mapping.lookup(value);
+}
+
+/// Store one i1 per bit in `storageMap` for every classical value in `block`
+/// that a quantum op reads. Bits known at compile time become constants.
+void materializeClassical(Block& block,
+                          DenseMap<Value, SmallVector<Value>>& storageMap,
+                          Location loc, PatternRewriter& rewriter) {
+  IRMapping mapping;
+  for (auto& op : block) {
+    if (op.getNumResults() != 1) {
+      continue;
+    }
+    auto value = op.getResult(0);
+    if (!isClassical(value) || !isa<IntegerType>(value.getType()) ||
+        llvm::none_of(value.getUsers(), [](Operation* user) {
+          return user->getNumResults() != 1 || !isClassical(user->getResult(0));
+        })) {
+      continue;
+    }
+
+    auto width = value.getType().getIntOrFloatBitWidth();
+    SmallVector<Value> bits;
+    if (auto constant = constantBits(value); succeeded(constant)) {
+      for (size_t i = 0; i < width; ++i) {
+        bits.push_back(arith::ConstantIntOp::create(
+            rewriter, loc, rewriter.getI1Type(), (*constant)[i]));
+      }
+    } else {
+      auto word = materializeValue(value, mapping, storageMap, rewriter);
+      for (size_t i = 0; i < width; ++i) {
+        Value shifted = word;
+        if (i > 0) {
+          auto amount =
+              arith::ConstantIntOp::create(rewriter, loc, word.getType(), i);
+          shifted = arith::ShRUIOp::create(rewriter, loc, word, amount);
+        }
+        bits.push_back(width == 1
+                           ? shifted
+                           : arith::TruncIOp::create(
+                                 rewriter, loc, rewriter.getI1Type(), shifted));
+      }
+    }
+    storageMap[value] = std::move(bits);
+  }
+}
 
 SmallVector<Value> rotateList(ArrayRef<Value> list, int64_t amount) {
   SmallVector<Value> result(list.size());
@@ -342,8 +439,8 @@ SmallVector<Value> getTemporaryInputs(Operation* op) {
   return llvm::to_vector(op->getOperands());
 }
 
-void emitGate(Location loc, ArrayRef<Value> controls, Value target,
-              PatternRewriter& rewriter) {
+void emitQuantumGate(Location loc, ArrayRef<Value> controls, Value target,
+                     PatternRewriter& rewriter) {
   if (!controls.empty()) {
     qc::CtrlOp::create(rewriter, loc, controls, {target}, [&](ValueRange args) {
       qc::XOp::create(rewriter, loc, args[0]);
@@ -351,6 +448,29 @@ void emitGate(Location loc, ArrayRef<Value> controls, Value target,
   } else {
     qc::XOp::create(rewriter, loc, target);
   }
+}
+
+void emitGate(Location loc, ArrayRef<Value> controls, Value target,
+              PatternRewriter& rewriter) {
+  SmallVector<Value> quantum;
+  Value classicalCondition;
+  for (auto control : controls) {
+    if (isa<QubitType>(control.getType())) {
+      quantum.push_back(control);
+      continue;
+    }
+    assert(!classicalCondition && "at most one classical control");
+    classicalCondition = control;
+  }
+  if (classicalCondition) {
+    auto ifOp = scf::IfOp::create(rewriter, loc, classicalCondition,
+                                  /*withElseRegion=*/false);
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(ifOp.thenBlock()->getTerminator());
+    emitQuantumGate(loc, quantum, target, rewriter);
+    return;
+  }
+  emitQuantumGate(loc, quantum, target, rewriter);
 }
 
 SmallVector<Statement> createConstantAdditionStatements(
@@ -419,7 +539,7 @@ createAdditionStatements(Value target, Value other, Statement::Kind kind,
             {.kind = Statement::Kind::Temp,
              .op = Statement::Op::Maj,
              .target = carries[i],
-             .operands = {result[i], otherValue[i], carries[i - 1]}});
+             .operands = {result[i], carries[i - 1], otherValue[i]}});
       }
     }
 
@@ -441,14 +561,6 @@ createAdditionStatements(Value target, Value other, Statement::Kind kind,
   }
 
   return statements;
-}
-
-FailureOr<APInt> constantBits(Value value) {
-  APInt bits;
-  if (matchPattern(value, m_ConstantInt(&bits))) {
-    return bits;
-  }
-  return failure();
 }
 
 bool isFolded(Operation* user, Value operand) {
@@ -949,6 +1061,10 @@ void makeGadgets(SmallVector<Statement>& statements,
     if (statement.op != Statement::Op::Maj) {
       continue;
     }
+    if (llvm::any_of(statement.operands,
+                     [&](Value v) { return !isa<QubitType>(v.getType()); })) {
+      continue;
+    }
 
     auto target = statement.target;
     bool done = false;
@@ -1159,7 +1275,7 @@ reachableTemporaries(Value source, DenseMap<Value, Value>& containers) {
 
   while (!toVisit.empty()) {
     auto [current, revisited] = toVisit.pop_back_val();
-    if (containers.contains(current)) {
+    if (containers.contains(current) || isPerIterationConstant(current)) {
       continue;
     }
     auto* defOp = current.getDefiningOp();
@@ -1309,6 +1425,9 @@ std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
       break;
     }
     for (auto [i, value] : llvm::enumerate(op->getOperands())) {
+      if (isPerIterationConstant(value)) {
+        continue;
+      }
       if (oracleOp.isKeptAlias(containers.lookup(value)) != kept) {
         continue;
       }
@@ -1339,9 +1458,10 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
 FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
                                DenseMap<Value, Value>& containers,
                                const DenseMap<Operation*, Value>& creations) {
-  if (!forOp.getInductionVar().use_empty()) {
-    oracle.emitOpError(
-        "cannot lower qoracle because a loop uses its induction variable");
+  if (llvm::any_of(forOp.getInductionVar().getUsers(),
+                   [&](Operation* user) { return !isClassical(user); })) {
+    oracle.emitOpError("cannot lower qoracle because a loop uses its induction "
+                       "variable in a way not known at compile time");
     return failure();
   }
   for (auto [init, iterArg] :
@@ -1443,6 +1563,9 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
           bool allowRegisters) {
   SmallVector<UpdateStep> updateSteps;
   for (auto& op : block.without_terminator()) {
+    if (isClassical(&op) && !matchPattern(op.getResult(0), m_Constant())) {
+      continue;
+    }
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       auto step = planLoop(forOp, oracle, containers, creations);
       if (failed(step)) {
@@ -1674,6 +1797,10 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
 bool validRegion(Block* block) {
   if (block
           ->walk([&](Operation* op) {
+            if (isClassical(op)) {
+              // Classical values such as iteration variables.
+              return WalkResult::advance();
+            }
             if (succeeded(matchShift(op))) {
               // A right shift by a constant is a relabeling.
               return WalkResult::advance();
@@ -1731,6 +1858,9 @@ void emitForLoop(OracleOp op, scf::ForOp forOp, Operation* outerLoop,
   auto newForOp =
       scf::ForOp::create(rewriter, loc, lowerBound, upperBound, stepValue);
   rewriter.setInsertionPoint(newForOp.getBody()->getTerminator());
+  storageMap[forOp.getInductionVar()] = {newForOp.getInductionVar()};
+  materializeClassical(*forOp.getBody(), storageMap, loc, rewriter);
+
   emitSteps(op, step.body, !outerLoop ? newForOp : outerLoop, loc, storageMap,
             loopHelpers, rewriter);
   for (auto [iterArg, yieldArg] :
@@ -1791,6 +1921,8 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
       }
     }
   }
+
+  materializeClassical(op.getRegion().front(), storageMap, loc, rewriter);
 
   SmallVector<Value> helpers;
   emitSteps(op, updateSteps, nullptr, loc, storageMap, helpers, rewriter);
@@ -1865,7 +1997,8 @@ protected:
     ConversionTarget target(*context);
     target.addIllegalDialect<QOracleDialect>();
     target.addLegalDialect<qc::QCDialect, arith::ArithDialect,
-                           memref::MemRefDialect, scf::SCFDialect>();
+                           memref::MemRefDialect, scf::SCFDialect,
+                           tensor::TensorDialect>();
 
     RewritePatternSet patterns(context);
     patterns.add<ConvertOracleOp>(context);

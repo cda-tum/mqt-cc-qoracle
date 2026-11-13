@@ -29,5 +29,6 @@ def QOracleToQC : Pass<"qoracle-to-qc", "mlir::ModuleOp"> {
 
   let dependentDialects = ["mlir::qc::QCDialect", "mlir::scf::SCFDialect",
                            "mlir::arith::ArithDialect",
-                           "mlir::memref::MemRefDialect"];
+                           "mlir::memref::MemRefDialect",
+                           "mlir::tensor::TensorDialect"];
 }

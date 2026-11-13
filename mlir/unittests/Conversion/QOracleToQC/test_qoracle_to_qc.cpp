@@ -24,7 +24,10 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/IR/Block.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -74,6 +77,9 @@ class BasisSimulator {
 public:
   /// Run the body of `function`, repeating the body of each `scf.for`.
   ///
+  /// Classical values, such as loop induction variables and the conditions of
+  /// `scf.if` operations, are evaluated by folding.
+  ///
   /// Each allocation in `inputs` starts with the matching value of `initial`;
   /// every other qubit starts at 0. Fails if a qubit is used after its
   /// deallocation or is not 0 when it is deallocated. Returns the final value
@@ -87,12 +93,14 @@ private:
   std::vector<bool> live_;
   DenseMap<Value, size_t> qubits_;
   DenseMap<Value, SmallVector<size_t>> registers_;
-  DenseMap<Value, int64_t> indices_;
+  DenseMap<Value, Attribute> classical_;
   DenseMap<Operation*, uint64_t> initialValues_;
   DenseMap<Operation*, SmallVector<size_t>> inputBits_;
 
   [[nodiscard]] SmallVector<size_t> allocate(size_t width, uint64_t value);
   [[nodiscard]] FailureOr<size_t> bitOf(Value qubit);
+  [[nodiscard]] int64_t indexOf(Value value) const;
+  [[nodiscard]] LogicalResult evaluate(Operation& op);
   [[nodiscard]] LogicalResult apply(Operation& op);
   [[nodiscard]] LogicalResult runBlock(Block& block);
 };
@@ -116,6 +124,31 @@ FailureOr<size_t> BasisSimulator::bitOf(Value qubit) {
     return failure();
   }
   return bit;
+}
+
+int64_t BasisSimulator::indexOf(Value value) const {
+  return cast<IntegerAttr>(classical_.at(value)).getInt();
+}
+
+LogicalResult BasisSimulator::evaluate(Operation& op) {
+  SmallVector<Attribute> operands;
+  for (auto operand : op.getOperands()) {
+    operands.push_back(classical_.lookup(operand));
+  }
+  SmallVector<OpFoldResult> results;
+  if (failed(op.fold(operands, results)) ||
+      results.size() != op.getNumResults()) {
+    ADD_FAILURE() << "cannot evaluate " << op.getName().getStringRef().str();
+    return failure();
+  }
+  for (auto [result, folded] : llvm::zip_equal(op.getResults(), results)) {
+    if (auto value = dyn_cast<Value>(folded)) {
+      classical_[result] = classical_.lookup(value);
+    } else {
+      classical_[result] = cast<Attribute>(folded);
+    }
+  }
+  return success();
 }
 
 LogicalResult BasisSimulator::apply(Operation& op) {
@@ -186,19 +219,36 @@ LogicalResult BasisSimulator::runBlock(Block& block) {
         ADD_FAILURE() << "loop carries values";
         return failure();
       }
-      const auto upper = indices_.at(loop.getUpperBound());
-      const auto step = indices_.at(loop.getStep());
-      for (auto i = indices_.at(loop.getLowerBound()); i < upper; i += step) {
+      const auto upper = indexOf(loop.getUpperBound());
+      const auto step = indexOf(loop.getStep());
+      Builder builder(op.getContext());
+      for (auto i = indexOf(loop.getLowerBound()); i < upper; i += step) {
+        classical_[loop.getInductionVar()] = builder.getIndexAttr(i);
         if (failed(runBlock(*loop.getBody()))) {
           return failure();
         }
       }
-    } else if (auto constant = dyn_cast<arith::ConstantIndexOp>(op)) {
-      indices_[constant.getResult()] = constant.value();
-    } else if (isa<arith::ConstantOp>(op)) {
-      // Constants captured by an oracle stay behind and hold no qubits.
+    } else if (auto branch = dyn_cast<scf::IfOp>(op)) {
+      if (branch.getNumResults() != 0) {
+        ADD_FAILURE() << "branch returns values";
+        return failure();
+      }
+      const auto taken = cast<IntegerAttr>(classical_.at(branch.getCondition()))
+                             .getValue()
+                             .getBoolValue();
+      auto& region = taken ? branch.getThenRegion() : branch.getElseRegion();
+      if (!region.empty() && failed(runBlock(region.front()))) {
+        return failure();
+      }
+    } else if (isa<arith::ArithDialect, tensor::TensorDialect>(
+                   op.getDialect())) {
+      // Classical values, including constants captured by an oracle, hold no
+      // qubits.
+      if (failed(evaluate(op))) {
+        return failure();
+      }
     } else if (auto load = dyn_cast<memref::LoadOp>(op)) {
-      const auto index = indices_.at(load.getIndices().front());
+      const auto index = indexOf(load.getIndices().front());
       const auto bit = registers_.at(load.getMemRef())[index];
       qubits_[load.getResult()] = bit;
     } else if (auto dealloc = dyn_cast<qc::DeallocOp>(op)) {
@@ -252,9 +302,10 @@ protected:
 
   void SetUp() override {
     DialectRegistry registry;
-    registry.insert<arith::ArithDialect, func::FuncDialect,
-                    memref::MemRefDialect, mqt::MQTDialect, qc::QCDialect,
-                    qoracle::QOracleDialect, scf::SCFDialect>();
+    registry
+        .insert<arith::ArithDialect, func::FuncDialect, memref::MemRefDialect,
+                mqt::MQTDialect, qc::QCDialect, qoracle::QOracleDialect,
+                scf::SCFDialect, tensor::TensorDialect>();
     context = std::make_unique<MLIRContext>(registry);
     context->loadAllAvailableDialects();
     handler = std::make_unique<ScopedDiagnosticHandler>(
@@ -3728,4 +3779,173 @@ TEST_F(QOracleToQCTest, SharesHelpersOfDifferentStepsInsideLoop) {
     return {in[0], in[1], x};
   });
   EXPECT_LE(countPeakHelpers(body), 5U);
+}
+
+// A loop body may read a different constant in each iteration, such as the
+// round constant of a hash function. The constant is extracted from a constant
+// tensor at the induction variable.
+TEST_F(QOracleToQCTest, XorsPerIterationConstantInsideLoop) {
+  expectLowersTo(R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %k = arith.constant dense<[3, 5, 12]> : tensor<3xi4>
+      %out = scf.for %i = %c0 to %c3 step %c1 iter_args(%acc = %vr) -> (i4) {
+        %ki = tensor.extract %k[%i] : tensor<3xi4>
+        %next = arith.xori %acc, %ki : i4
+        scf.yield %next : i4
+      }
+      qoracle.yield %out : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0] ^ 3U ^ 5U ^ 12U};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AddsPerIterationConstantInsideLoop) {
+  expectLowersTo(R"mlir(
+    %r = memref.alloc() : memref<5x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<5x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c4 = arith.constant 4 : index
+      %k = arith.constant dense<[7, 12, 25, 0]> : tensor<4xi5>
+      %out = scf.for %i = %c0 to %c4 step %c1 iter_args(%acc = %vr) -> (i5) {
+        %ki = tensor.extract %k[%i] : tensor<4xi5>
+        %next = arith.addi %acc, %ki : i5
+        scf.yield %next : i5
+      }
+      qoracle.yield %out : i5
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0] + 7U + 12U + 25U};
+                 });
+}
+
+// A body that covers several iterations of the source loop, such as 16 rounds
+// of SHA-256, reads the constants at offsets of the induction variable.
+TEST_F(QOracleToQCTest, ReadsConstantsAtOffsetsOfInductionVariable) {
+  expectLowersTo(R"mlir(
+    %r = memref.alloc() : memref<5x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<5x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c4 = arith.constant 4 : index
+      %k = arith.constant dense<[7, 12, 25, 3]> : tensor<4xi5>
+      %out = scf.for %i = %c0 to %c4 step %c2 iter_args(%acc = %vr) -> (i5) {
+        %j = arith.addi %i, %c1 : index
+        %ki = tensor.extract %k[%i] : tensor<4xi5>
+        %kj = tensor.extract %k[%j] : tensor<4xi5>
+        %sum = arith.addi %acc, %ki : i5
+        %next = arith.xori %sum, %kj : i5
+        scf.yield %next : i5
+      }
+      qoracle.yield %out : i5
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   const std::array<uint64_t, 4> k{7, 12, 25, 3};
+                   auto x = in[0];
+                   for (size_t i = 0; i < k.size(); i += 2) {
+                     x = ((x + k[i]) & 31U) ^ k[i + 1];
+                   }
+                   return {x};
+                 });
+}
+
+TEST_F(QOracleToQCTest, AndPerIterationConstantIntoConsumedRegister) {
+  expectLowersTo(R"mlir(
+    %x = memref.alloc() : memref<4x!qc.qubit>
+    %y = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%x : memref<4x!qc.qubit> as %vx)
+                   consumed(%y : memref<4x!qc.qubit> as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %k = arith.constant dense<[3, 10, 6]> : tensor<3xi4>
+      %out = scf.for %i = %c0 to %c3 step %c1 iter_args(%acc = %vy) -> (i4) {
+        %ki = tensor.extract %k[%i] : tensor<3xi4>
+        %masked = arith.andi %vx, %ki : i4
+        %next = arith.xori %acc, %masked : i4
+        scf.yield %next : i4
+      }
+      qoracle.yield %out : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0],
+                           in[1] ^ (in[0] & 3U) ^ (in[0] & 10U) ^ (in[0] & 6U)};
+                 });
+}
+
+// Any classical value computed from the induction variable is a per-iteration
+// constant, not only a tensor element.
+TEST_F(QOracleToQCTest, XorsInductionVariableInsideLoop) {
+  expectLowersTo(R"mlir(
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %out = scf.for %i = %c0 to %c3 step %c1 iter_args(%acc = %vr) -> (i4) {
+        %v = arith.index_cast %i : index to i4
+        %next = arith.xori %acc, %v : i4
+        scf.yield %next : i4
+      }
+      qoracle.yield %out : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0] ^ 0U ^ 1U ^ 2U};
+                 });
+}
+
+// Adding a per-iteration constant costs no more than adding the most expensive
+// constant known at compile time, the one with every bit set. The lowering
+// does not first load the constant into helper qubits.
+TEST_F(QOracleToQCTest, AddsPerIterationConstantLikeFixedConstant) {
+  constexpr StringRef perIteration = R"mlir(
+    %r = memref.alloc() : memref<5x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<5x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %k = arith.constant dense<[31, 0, 21]> : tensor<3xi5>
+      %out = scf.for %i = %c0 to %c3 step %c1 iter_args(%acc = %vr) -> (i5) {
+        %ki = tensor.extract %k[%i] : tensor<3xi5>
+        %next = arith.addi %acc, %ki : i5
+        scf.yield %next : i5
+      }
+      qoracle.yield %out : i5
+    })mlir";
+  constexpr StringRef fixed = R"mlir(
+    %r = memref.alloc() : memref<5x!qc.qubit>
+    qoracle.oracle consumed(%r : memref<5x!qc.qubit> as %vr) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %k = arith.constant 31 : i5
+      %out = scf.for %i = %c0 to %c3 step %c1 iter_args(%acc = %vr) -> (i5) {
+        %next = arith.addi %acc, %k : i5
+        scf.yield %next : i5
+      }
+      qoracle.yield %out : i5
+    })mlir";
+  EXPECT_LE(countPeakHelpers(perIteration), countPeakHelpers(fixed));
+  EXPECT_LE(countToffolis(perIteration), countToffolis(fixed));
+}
+
+TEST_F(QOracleToQCTest, RejectsTensorIndexedByQuantumValue) {
+  expectRejected(R"mlir(
+    %k = memref.alloc() : memref<2x!qc.qubit>
+    %r = memref.alloc() : memref<2x!qc.qubit>
+    qoracle.oracle kept(%k : memref<2x!qc.qubit> as %vk)
+                   consumed(%r : memref<2x!qc.qubit> as %vr) {
+      %table = arith.constant dense<[0, 1, 3, 2]> : tensor<4xi2>
+      %index = arith.index_cast %vk : i2 to index
+      %entry = tensor.extract %table[%index] : tensor<4xi2>
+      %next = arith.xori %vr, %entry : i2
+      qoracle.yield %next : i2
+    })mlir",
+                 "contains invalid operations");
 }

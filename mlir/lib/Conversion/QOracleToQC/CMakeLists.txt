@@ -18,6 +18,7 @@ add_mlir_conversion_library(
   MLIRQOracleDialect
   MLIRArithDialect
   MLIRSCFDialect
+  MLIRTensorDialect
   MLIRMemRefDialect
   MLIRTransforms
   MLIRTransformUtils)
