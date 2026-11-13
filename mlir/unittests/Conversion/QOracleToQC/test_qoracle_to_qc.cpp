@@ -1918,7 +1918,8 @@ TEST_F(QOracleToQCTest, XorsNandOfKeptRegisters) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1], in[2] ^ ~(in[0] & in[1])};
   });
-  EXPECT_EQ(countHelpers(body), 4U);
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 4U);
 }
 
 // r + ~a = r - a - 1, so the carries must see the inverted bits.
@@ -2105,12 +2106,12 @@ TEST_F(QOracleToQCTest, XorsOrOfKeptRegisters) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1], in[2] ^ (in[0] | in[1])};
   });
-  EXPECT_EQ(countHelpers(body), 4U);
-  EXPECT_EQ(countToffolis(body), 8U);
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 4U);
 }
 
 // The form of round 4 of MD5: c ^ (b | ~d). The NOT of `d` is applied in
-// place, so only the OR needs helpers.
+// place, and the OR goes straight into `c`.
 TEST_F(QOracleToQCTest, XorsOrWithInvertedKeptRegister) {
   constexpr StringRef body = R"mlir(
     %b = memref.alloc() : memref<4x!qc.qubit>
@@ -2128,8 +2129,8 @@ TEST_F(QOracleToQCTest, XorsOrWithInvertedKeptRegister) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1], in[2] ^ (in[0] | ~in[1])};
   });
-  EXPECT_EQ(countHelpers(body), 4U);
-  EXPECT_EQ(countToffolis(body), 8U);
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 4U);
 }
 
 TEST_F(QOracleToQCTest, AddsOrOfKeptRegisters) {
@@ -2254,8 +2255,8 @@ TEST_F(QOracleToQCTest, OrsInsideLoop) {
 }
 
 // The majority of `a`, `b` and `c`, as mlir_emit writes it. Recognized as one
-// operation, it is computed in place in one of its operands with one Toffoli
-// per bit, and undone with one more. Three separate ANDs cost far more.
+// operation, it goes straight into `r` with one Toffoli per bit. Three
+// separate ANDs cost far more.
 TEST_F(QOracleToQCTest, XorsMajority) {
   constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<3x!qc.qubit>
@@ -2279,7 +2280,7 @@ TEST_F(QOracleToQCTest, XorsMajority) {
             in[3] ^ ((in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2]))};
   });
   EXPECT_EQ(countHelpers(body), 0U);
-  EXPECT_LE(countToffolis(body), 6U);
+  EXPECT_LE(countToffolis(body), 3U);
 }
 
 // The form of Maj in FIPS 180-4: (a & b) ^ (a & c) ^ (b & c).
@@ -2306,7 +2307,7 @@ TEST_F(QOracleToQCTest, XorsMajorityWrittenWithXor) {
             in[3] ^ ((in[0] & in[1]) ^ (in[0] & in[2]) ^ (in[1] & in[2]))};
   });
   EXPECT_EQ(countHelpers(body), 0U);
-  EXPECT_LE(countToffolis(body), 6U);
+  EXPECT_LE(countToffolis(body), 3U);
 }
 
 // The pairs may come in any order, with their operands swapped and either side
@@ -2334,7 +2335,7 @@ TEST_F(QOracleToQCTest, RecognizesMajorityInAnyOrder) {
             in[3] ^ ((in[0] & in[1]) | (in[0] & in[2]) | (in[1] & in[2]))};
   });
   EXPECT_EQ(countHelpers(body), 0U);
-  EXPECT_LE(countToffolis(body), 6U);
+  EXPECT_LE(countToffolis(body), 3U);
 }
 
 // The prototype needs one carry helper and 10 Toffolis: 6 for the adder and
@@ -3482,7 +3483,8 @@ TEST_F(QOracleToQCTest, XorsPredicateIntoTargetQubit) {
 
 // A predicate compares words with constants and XORs the result into a target
 // qubit. `a == 5` is the AND of the bits of `a`, with the bits where 5 has a 0
-// inverted: three Toffolis for 4 bits, and as many to uncompute.
+// inverted: two Toffolis into helpers for the pairs of bits, one into the
+// target for the root, and two to uncompute the pairs.
 TEST_F(QOracleToQCTest, XorsComparisonWithConstantIntoTarget) {
   constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
@@ -3497,8 +3499,8 @@ TEST_F(QOracleToQCTest, XorsComparisonWithConstantIntoTarget) {
   expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
     return {in[0], in[1] ^ static_cast<uint64_t>(in[0] == 5)};
   });
-  EXPECT_LE(countToffolis(body), 6U);
-  EXPECT_LE(countPeakHelpers(body), 3U);
+  EXPECT_LE(countToffolis(body), 5U);
+  EXPECT_LE(countPeakHelpers(body), 2U);
 }
 
 // Comparing with 0 inverts every bit; comparing with all ones inverts none.
@@ -3948,4 +3950,71 @@ TEST_F(QOracleToQCTest, RejectsTensorIndexedByQuantumValue) {
       qoracle.yield %next : i2
     })mlir",
                  "contains invalid operations");
+}
+
+// An AND whose only reader XORs it into a register goes straight into that
+// register: one Toffoli per bit and no helpers.
+TEST_F(QOracleToQCTest, XorsAndIntoRegisterWithoutHelpers) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %r = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb)
+                   consumed(%r : memref<4x!qc.qubit> as %vr) {
+      %and = arith.andi %va, %vb : i4
+      %next = arith.xori %vr, %and : i4
+      qoracle.yield %next : i4
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2] ^ (in[0] & in[1])};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 4U);
+}
+
+// The XOR that reads the AND also reads another register, so the AND goes into
+// the target next to the CNOTs of that register.
+TEST_F(QOracleToQCTest, XorsAndWithOtherRegisterIntoRegister) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %c = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb,
+                        %c : memref<3x!qc.qubit> as %vc)
+                   consumed(%r : memref<3x!qc.qubit> as %vr) {
+      %and = arith.andi %va, %vb : i3
+      %mixed = arith.xori %and, %vc : i3
+      %next = arith.xori %vr, %mixed : i3
+      qoracle.yield %next : i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    return {in[0], in[1], in[2], in[3] ^ (in[0] & in[1]) ^ in[2]};
+  });
+  EXPECT_EQ(countHelpers(body), 0U);
+  EXPECT_LE(countToffolis(body), 3U);
+}
+
+// Two XORs read the AND, so it stays in helpers and is computed once.
+TEST_F(QOracleToQCTest, XorsSharedAndIntoTwoRegisters) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %r = memref.alloc() : memref<3x!qc.qubit>
+    %s = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%r : memref<3x!qc.qubit> as %vr,
+                            %s : memref<3x!qc.qubit> as %vs) {
+      %and = arith.andi %va, %vb : i3
+      %nextR = arith.xori %vr, %and : i3
+      %nextS = arith.xori %vs, %and : i3
+      qoracle.yield %nextR, %nextS : i3, i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1], in[2] ^ (in[0] & in[1]),
+                           in[3] ^ (in[0] & in[1])};
+                 });
 }
