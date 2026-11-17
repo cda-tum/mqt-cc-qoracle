@@ -795,6 +795,76 @@ TEST_F(QOracleTransformsTest, ScheduleLetsTemporaryBeOverwritten) {
   EXPECT_TRUE(reader->isBeforeInBlock(addition)) << print(oracle);
 }
 
+TEST_F(QOracleTransformsTest, ScheduleMovesUnblockingUpdateFirst) {
+  // The addition could overwrite only %B, which the XOR still reads. The XOR
+  // can overwrite %C, which nothing else needs, so it moves first and leaves
+  // the addition as the last reader of %B.
+  auto moduleOp = transform(R"mlir(
+    func.func @main() {
+      %a = memref.alloc() : memref<3x!qc.qubit>
+      %b = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%a : memref<3x!qc.qubit> as %A)
+                     consumed(%b : memref<3x!qc.qubit> as %B,
+                              %c : memref<3x!qc.qubit> as %C) {
+        %p = arith.addi %A, %B : i3
+        %q = arith.xori %B, %C : i3
+        qoracle.yield %p, %q : i3, i3
+      }
+      return
+    })mlir",
+                            SCHEDULE);
+  ASSERT_TRUE(moduleOp);
+  auto oracle = findOracle(*moduleOp);
+  arith::AddIOp addition;
+  arith::XOrIOp exclusiveOr;
+  oracle.walk([&](arith::AddIOp op) { addition = op; });
+  oracle.walk([&](arith::XOrIOp op) { exclusiveOr = op; });
+  ASSERT_TRUE(addition && exclusiveOr);
+  EXPECT_TRUE(exclusiveOr->isBeforeInBlock(addition)) << print(oracle);
+}
+
+TEST_F(QOracleTransformsTest, ScheduleTreatsYieldedOperandAsNeeded) {
+  // The oracle yields %C, so the XOR cannot overwrite it and does not unblock
+  // the addition. The original order stays.
+  expectUnchanged(R"mlir(
+    func.func @main() {
+      %a = memref.alloc() : memref<3x!qc.qubit>
+      %b = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      %d = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle kept(%a : memref<3x!qc.qubit> as %A)
+                     consumed(%b : memref<3x!qc.qubit> as %B,
+                              %c : memref<3x!qc.qubit> as %C,
+                              %d : memref<3x!qc.qubit> as %D) {
+        %p = arith.addi %A, %B : i3
+        %q = arith.xori %B, %C : i3
+        qoracle.yield %p, %C, %q : i3, i3, i3
+      }
+      return
+    })mlir",
+                  SCHEDULE);
+}
+
+TEST_F(QOracleTransformsTest, ScheduleKeepsOrderOfUpdatesThatBlockEachOther) {
+  // Both additions could overwrite only %X, which the other one still reads.
+  // Neither can unblock the other, so the original order stays.
+  expectUnchanged(R"mlir(
+    func.func @main(%k: i3, %m: i3) {
+      %b = memref.alloc() : memref<3x!qc.qubit>
+      %c = memref.alloc() : memref<3x!qc.qubit>
+      qoracle.oracle consumed(%b : memref<3x!qc.qubit> as %B,
+                              %c : memref<3x!qc.qubit> as %C) {
+        %x = arith.addi %B, %C : i3
+        %u = arith.addi %x, %k : i3
+        %v = arith.addi %x, %m : i3
+        qoracle.yield %u, %v : i3, i3
+      }
+      return
+    })mlir",
+                  SCHEDULE);
+}
+
 TEST_F(QOracleTransformsTest, ScheduleKeepsOrderWhenNoReaderCanOverwrite) {
   // %A is kept and %x is captured, so no reader may overwrite them, and ties
   // keep the original order.

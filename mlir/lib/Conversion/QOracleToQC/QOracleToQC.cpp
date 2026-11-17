@@ -87,23 +87,36 @@ struct Statement {
   SmallVector<bool> negated;
 };
 
+/// Optimizations of the lowering that can be turned off, for example to
+/// measure what each contributes. See the options of the pass.
+struct LoweringOptions {
+  bool registers = true;
+  bool borrowing = true;
+  bool fusion = true;
+  bool gadgets = true;
+  bool reuseLoopHelpers = true;
+};
+
+/// Allocates helper qubits. Inside a loop, helpers are allocated before the
+/// outermost loop and reused: `loopHelpers` holds those that are currently free
+/// and at 0. A helper returns there when its step or register is done with it.
+///
+/// Statement fusion may discard helpers after they are allocated, so the
+/// helpers of a step start as fresh placeholders and take free helpers from
+/// `loopHelpers` only in `release`. A register takes them right away.
 struct HelperAllocator {
   Operation* outerLoop;
   Location loc;
   PatternRewriter& rewriter;
   SmallVector<Value>& loopHelpers;
-  SmallVector<Value> free;
+  const LoweringOptions& options;
+  bool forRegister = false;
   SmallVector<Value> allocated;
 
-  void init() {
-    if (outerLoop != nullptr) {
-      free.assign(loopHelpers.begin(), loopHelpers.end());
-    }
-  }
-
   Value allocate() {
-    if (outerLoop != nullptr && !free.empty()) {
-      auto helper = free.pop_back_val();
+    if (outerLoop != nullptr && forRegister && options.reuseLoopHelpers &&
+        !loopHelpers.empty()) {
+      auto helper = loopHelpers.pop_back_val();
       allocated.push_back(helper);
       return helper;
     }
@@ -112,31 +125,32 @@ struct HelperAllocator {
       rewriter.setInsertionPoint(outerLoop);
     }
     auto qubit = qc::AllocOp::create(rewriter, loc);
-
-    if (outerLoop != nullptr) {
-      loopHelpers.push_back(qubit);
-    }
     allocated.push_back(qubit);
     return qubit;
   }
 
   void release() {
-    if (outerLoop == nullptr) {
-      for (auto qubit : allocated) {
-        qc::DeallocOp::create(rewriter, loc, qubit);
+    if (outerLoop != nullptr) {
+      for (auto& qubit : allocated) {
+        if (!options.reuseLoopHelpers || loopHelpers.empty()) {
+          break;
+        }
+        auto helper = loopHelpers.pop_back_val();
+        auto* placeholder = qubit.getDefiningOp();
+        rewriter.replaceAllUsesWith(qubit, helper);
+        rewriter.eraseOp(placeholder);
+        qubit = helper;
       }
+      llvm::append_range(loopHelpers, allocated);
+      return;
+    }
+    for (auto qubit : allocated) {
+      qc::DeallocOp::create(rewriter, loc, qubit);
     }
   }
 
   void discard(Value qubit) {
     llvm::erase(allocated, qubit);
-    if (outerLoop != nullptr && !qubit.use_empty()) {
-      free.push_back(qubit);
-      return;
-    }
-    if (outerLoop != nullptr) {
-      llvm::erase(loopHelpers, qubit);
-    }
     rewriter.eraseOp(qubit.getDefiningOp());
   }
 };
@@ -941,8 +955,10 @@ buildStatements(const UpdateStep& update,
   dropZeroBits(statements);
   // XOR temporaries go first: merging one into its reader turns the ANDs it
   // reads into operands of that reader, which can then be fused as well.
-  fuseTemporaries(statements, allocator, /*xors=*/true);
-  fuseTemporaries(statements, allocator, /*xors=*/false);
+  if (allocator.options.fusion) {
+    fuseTemporaries(statements, allocator, /*xors=*/true);
+    fuseTemporaries(statements, allocator, /*xors=*/false);
+  }
   return statements;
 }
 
@@ -1091,6 +1107,13 @@ void makeGadgets(SmallVector<Statement>& statements,
                      [&](Value v) { return !isa<QubitType>(v.getType()); })) {
       continue;
     }
+    // A majority fused into an XOR shares its target with that XOR, so the
+    // target cannot be given up.
+    if (llvm::any_of(statements, [&](const Statement& other) {
+          return &other != &statement && other.target == statement.target;
+        })) {
+      continue;
+    }
 
     auto target = statement.target;
     bool done = false;
@@ -1175,7 +1198,7 @@ void emitUpdateStep(const UpdateStep& step,
                     DenseMap<Value, SmallVector<Value>>& storageMap,
                     Location loc, Operation* outerLoop,
                     SmallVector<Value>& loopHelpers,
-                    PatternRewriter& rewriter) {
+                    const LoweringOptions& options, PatternRewriter& rewriter) {
   if (step.kind == UpdateStep::Kind::Copy) {
     auto source = storageMap.at(step.otherValue);
     auto target = storageMap.at(step.overwriteValue);
@@ -1188,9 +1211,16 @@ void emitUpdateStep(const UpdateStep& step,
   if (step.kind == UpdateStep::Kind::Create &&
       !storageMap.contains(step.overwriteValue)) {
     auto width = step.overwriteValue.getType().getIntOrFloatBitWidth();
+    // The register lives until its cleanup, so it is not released here.
+    HelperAllocator registerAllocator{.outerLoop = outerLoop,
+                                      .loc = loc,
+                                      .rewriter = rewriter,
+                                      .loopHelpers = loopHelpers,
+                                      .options = options,
+                                      .forRegister = true};
     SmallVector<Value> reg;
     for (size_t i = 0; i < width; i++) {
-      reg.push_back(qc::AllocOp::create(rewriter, loc));
+      reg.push_back(registerAllocator.allocate());
     }
     storageMap[step.overwriteValue] = reg;
   }
@@ -1205,8 +1235,8 @@ void emitUpdateStep(const UpdateStep& step,
   HelperAllocator allocator{.outerLoop = outerLoop,
                             .loc = loc,
                             .rewriter = rewriter,
-                            .loopHelpers = loopHelpers};
-  allocator.init();
+                            .loopHelpers = loopHelpers,
+                            .options = options};
 
   for (auto* temporary : step.temporaries) {
     auto temporaryBits = relabel(temporary, storageMap);
@@ -1247,7 +1277,9 @@ void emitUpdateStep(const UpdateStep& step,
   }
 
   auto statements = buildStatements(step, storageMap, allocator);
-  makeGadgets(statements, allocator);
+  if (options.gadgets) {
+    makeGadgets(statements, allocator);
+  }
 
   for (const auto& statement : statements) {
     if (statement.kind == Statement::Kind::Update && statement.fused) {
@@ -1264,21 +1296,84 @@ void emitUpdateStep(const UpdateStep& step,
   allocator.release();
 }
 
+void emitForLoop(OracleOp op, scf::ForOp forOp, Operation* outerLoop,
+                 const UpdateStep& step, Location loc,
+                 DenseMap<Value, SmallVector<Value>>& storageMap,
+                 SmallVector<Value>& loopHelpers,
+                 const LoweringOptions& options, PatternRewriter& rewriter);
+
+/// Whether `op` acts on qubits. A gate under `scf.if` depends on a
+/// per-iteration constant; an `scf.for` holds the gates of a loop.
+bool isGate(Operation& op) {
+  return isa<qc::XOp, qc::CtrlOp, qc::SWAPOp, scf::IfOp, scf::ForOp>(op);
+}
+
+void reverseLoop(scf::ForOp forOp, PatternRewriter& rewriter);
+
+/// Reverse the order of the gates in `block`. The classical operations that
+/// the gates read stay in front of them.
+void reverseGates(Block& block, PatternRewriter& rewriter) {
+  SmallVector<Operation*> gates;
+  for (auto& op : block.without_terminator()) {
+    if (isGate(op)) {
+      gates.push_back(&op);
+    }
+  }
+  for (auto* gate : llvm::reverse(gates)) {
+    gate->moveBefore(block.getTerminator());
+    if (auto forOp = dyn_cast<scf::ForOp>(gate)) {
+      reverseLoop(forOp, rewriter);
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(gate)) {
+      reverseGates(*ifOp.thenBlock(), rewriter);
+    }
+  }
+}
+
+/// Turn a lowered loop into its inverse: the iterations run last to first,
+/// each with its gates reversed. The bounds are constants.
+void reverseLoop(scf::ForOp forOp, PatternRewriter& rewriter) {
+  auto lower = *getConstantIntValue(forOp.getLowerBound());
+  auto upper = *getConstantIntValue(forOp.getUpperBound());
+  auto stride = *getConstantIntValue(forOp.getStep());
+  auto iterations = upper > lower ? (upper - lower + stride - 1) / stride : 0;
+  auto inductionVar = forOp.getInductionVar();
+  if (iterations > 0 && !inductionVar.use_empty()) {
+    // Iteration k reads the induction variable of iteration n - 1 - k.
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(forOp.getBody());
+    auto last = lower + ((iterations - 1) * stride);
+    auto sum =
+        arith::ConstantIndexOp::create(rewriter, forOp.getLoc(), lower + last);
+    auto reversed =
+        arith::SubIOp::create(rewriter, forOp.getLoc(), sum, inductionVar);
+    rewriter.replaceAllUsesExcept(inductionVar, reversed, reversed);
+  }
+  reverseGates(*forOp.getBody(), rewriter);
+}
+
 void emitInverseStep(const UpdateStep& step,
                      DenseMap<Value, SmallVector<Value>>& storageMap,
-                     Location loc, PatternRewriter& rewriter) {
+                     Location loc, Operation* outerLoop,
+                     SmallVector<Value>& loopHelpers,
+                     const LoweringOptions& options,
+                     PatternRewriter& rewriter) {
   Block* block = rewriter.getInsertionBlock();
   auto end = rewriter.getInsertionPoint();
   Operation* marker = end == block->begin() ? nullptr : &*std::prev(end);
 
-  SmallVector<Value> loopHelpers;
-  emitUpdateStep(step, storageMap, loc, nullptr, loopHelpers, rewriter);
+  if (auto forOp = dyn_cast<scf::ForOp>(step.updateOp)) {
+    emitForLoop(forOp->getParentOfType<OracleOp>(), forOp, outerLoop, step, loc,
+                storageMap, loopHelpers, options, rewriter);
+  } else {
+    emitUpdateStep(step, storageMap, loc, outerLoop, loopHelpers, options,
+                   rewriter);
+  }
 
   auto first =
       (marker != nullptr) ? std::next(marker->getIterator()) : block->begin();
   SmallVector<Operation*> gates;
   for (auto& op : llvm::make_range(first, rewriter.getInsertionPoint())) {
-    if (isa<qc::XOp, qc::CtrlOp>(op)) {
+    if (isGate(op)) {
       gates.push_back(&op);
     }
   }
@@ -1290,6 +1385,13 @@ void emitInverseStep(const UpdateStep& step,
   for (auto* gate : ArrayRef(gates).drop_front()) {
     gate->moveBefore(front);
     front = gate;
+  }
+  for (auto* gate : gates) {
+    if (auto forOp = dyn_cast<scf::ForOp>(gate)) {
+      reverseLoop(forOp, rewriter);
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(gate)) {
+      reverseGates(*ifOp.thenBlock(), rewriter);
+    }
   }
 }
 
@@ -1352,6 +1454,18 @@ SmallVector<Value> writtenContainers(const UpdateStep& step,
 DenseSet<Value> readContainers(const UpdateStep& step,
                                DenseMap<Value, Value>& containers) {
   DenseSet<Value> reads;
+  if (auto forOp = dyn_cast<scf::ForOp>(step.updateOp)) {
+    // The body reads its iteration arguments and the values defined above it.
+    llvm::SetVector<Value> captured;
+    getUsedValuesDefinedAbove(forOp.getRegion(), captured);
+    captured.insert_range(forOp.getInitArgs());
+    for (auto value : captured) {
+      if (containers.contains(value)) {
+        reads.insert(containers.at(value));
+      }
+    }
+    return reads;
+  }
   if (step.otherValue && containers.contains(step.otherValue)) {
     reads.insert(containers[step.otherValue]);
   }
@@ -1374,16 +1488,18 @@ DenseSet<Value> readContainers(const UpdateStep& step,
   return reads;
 }
 
+/// Mark the steps to undo at the end: those that write a register other than
+/// a consumed alias or one of `persistent`. A loop is undone by running its
+/// inverse body backwards.
 bool planCleanup(SmallVector<UpdateStep>& steps, OracleOp oracle,
-                 DenseMap<Value, Value>& containers, bool allowRollback) {
+                 DenseMap<Value, Value>& containers, bool allowRollback,
+                 ArrayRef<Value> persistent) {
   for (auto& step : steps) {
     if (llvm::any_of(writtenContainers(step, containers), [&](Value write) {
-          return !oracle.isConsumedAlias(write);
+          return !oracle.isConsumedAlias(write) &&
+                 !llvm::is_contained(persistent, write);
         })) {
       step.cleanup = true;
-      if (isa<scf::ForOp>(step.updateOp)) {
-        return false;
-      }
     }
   }
 
@@ -1411,6 +1527,16 @@ bool planCleanup(SmallVector<UpdateStep>& steps, OracleOp oracle,
           repeat = true;
         }
       }
+    }
+    // A step that is undone and redone must read the same values both
+    // times, so step i, which runs in between, must not write what it reads.
+    auto writesI = writtenContainers(steps[i], containers);
+    if (llvm::any_of(toUndo, [&](size_t j) {
+          auto reads = readContainers(steps[j], containers);
+          return llvm::any_of(
+              writesI, [&](Value write) { return reads.contains(write); });
+        })) {
+      return false;
     }
     if (llvm::any_of(toUndo, [&](size_t j) {
           auto reads = readContainers(steps[j], containers);
@@ -1451,7 +1577,22 @@ bool isReadByLaterStep(Operation* op, Value value,
       if (!promoted) {
         return true;
       }
-      promoted->push_back(ancestor);
+      // A shift inside a rotation or an AND inside a majority is computed as
+      // part of that operation, so the operation gets the register.
+      auto* reader = ancestor;
+      if (isa<arith::ShLIOp, arith::ShRUIOp>(reader) && reader->hasOneUse() &&
+          succeeded(matchRotation(*reader->user_begin()))) {
+        reader = *reader->user_begin();
+      }
+      if (auto* root = majorityRoot(reader)) {
+        reader = root;
+      }
+      if (!reader->isBeforeInBlock(op)) {
+        return true;
+      }
+      if (!llvm::is_contained(*promoted, reader)) {
+        promoted->push_back(reader);
+      }
       continue;
     }
   }
@@ -1521,9 +1662,24 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
           const DenseMap<Operation*, Value>& creations, bool allowBorrowing,
           bool allowRegisters, bool allowRollback);
 
+bool planCleanup(SmallVector<UpdateStep>& steps, OracleOp oracle,
+                 DenseMap<Value, Value>& containers, bool allowRollback,
+                 ArrayRef<Value> persistent = {});
+
+/// Plan a loop whose body may create helper registers. The body cleans them
+/// up at the end of each iteration, so each iteration starts with them at 0.
+///
+/// The iteration arguments live in the registers of the initial values, which
+/// are consumed or helper registers, or kept registers when borrowing is on. A
+/// loop in helper or kept registers is undone at the end like any other step
+/// that writes them. The body may yield the
+/// iteration arguments in a permutation of these registers; SWAP gates at the
+/// end of each iteration move them back.
 FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
                                DenseMap<Value, Value>& containers,
-                               const DenseMap<Operation*, Value>& creations) {
+                               const DenseMap<Operation*, Value>& creations,
+                               bool allowBorrowing, bool allowRegisters,
+                               bool allowRollback) {
   if (llvm::any_of(forOp.getInductionVar().getUsers(),
                    [&](Operation* user) { return !isClassical(user); })) {
     oracle.emitOpError("cannot lower qoracle because a loop uses its induction "
@@ -1532,10 +1688,13 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
   }
   for (auto [init, iterArg] :
        llvm::zip_equal(forOp.getInitArgs(), forOp.getRegionIterArgs())) {
-    if (!containers.contains(init) || oracle.isKeptAlias(containers[init])) {
+    // The loop overwrites its initial values. A kept register gets its value
+    // back only when borrowing undoes the loop at the end.
+    if (!containers.contains(init) ||
+        (oracle.isKeptAlias(containers[init]) && !allowBorrowing)) {
       oracle.emitOpError(
           "cannot lower qoracle because a loop initial value is not stored in "
-          "consumed qubits");
+          "consumed or helper qubits");
       return failure();
     }
     if (!isLastReader(forOp, init)) {
@@ -1544,8 +1703,10 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
           "the loop");
       return failure();
     }
-    auto container = containers.at(init);
-    containers[iterArg] = container;
+    // Inside the body, each iteration argument is a register of its own: the
+    // body updates it in place whether it lives in consumed, helper or
+    // borrowed kept qubits.
+    containers[iterArg] = iterArg;
   }
 
   llvm::SetVector<Value> captured;
@@ -1569,17 +1730,28 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
   }
 
   auto body = planBlock(forOp.getBodyRegion().front(), oracle, containers,
-                        creations, false, false, false);
+                        creations, false, allowRegisters, allowRollback);
   if (failed(body)) {
     return failure();
   }
+  SmallVector<Value> iterContainers;
+  for (auto iterArg : forOp.getRegionIterArgs()) {
+    iterContainers.push_back(containers.at(iterArg));
+  }
+  if (!planCleanup(*body, oracle, containers, allowRollback, iterContainers)) {
+    oracle.emitOpError("cannot lower qoracle because a loop body cannot clean "
+                       "up its helper registers");
+    return failure();
+  }
 
-  for (auto [i, bodyYield, iterArg] :
-       llvm::enumerate(forOp.getBody()->getTerminator()->getOperands(),
-                       forOp.getRegionIterArgs())) {
-    if (containers[bodyYield] != containers[iterArg]) {
+  DenseSet<Value> yieldedContainers;
+  for (auto [i, bodyYield] :
+       llvm::enumerate(forOp.getBody()->getTerminator()->getOperands())) {
+    auto container = containers.lookup(bodyYield);
+    if (!llvm::is_contained(iterContainers, container) ||
+        !yieldedContainers.insert(container).second) {
       oracle.emitOpError("cannot lower qoracle because the loop yields value ")
-          << i << " into other qubits than its iteration argument";
+          << i << " into other qubits than its iteration arguments";
       return failure();
     }
   }
@@ -1633,7 +1805,8 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
       continue;
     }
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      auto step = planLoop(forOp, oracle, containers, creations);
+      auto step = planLoop(forOp, oracle, containers, creations, allowBorrowing,
+                           allowRegisters, allowRollback);
       if (failed(step)) {
         return failure();
       }
@@ -1849,13 +2022,18 @@ planWith(OracleOp oracle, bool allowBorrowing, bool allowRegisters,
   return success(updateSteps);
 }
 
-FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
+FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle,
+                                        const LoweringOptions& options) {
   DenseMap<Value, Value> containers;
   {
     ScopedDiagnosticHandler silence(oracle.getContext(),
                                     [](Diagnostic&) { return success(); });
     for (auto [registers, borrowing] : SmallVector<std::pair<bool, bool>>{
              {true, true}, {true, false}, {false, true}}) {
+      if ((registers && !options.registers) ||
+          (borrowing && !options.borrowing)) {
+        continue;
+      }
       containers.clear();
       auto steps = planWith(oracle, borrowing, registers, false, containers);
       if (succeeded(steps) && planCleanup(*steps, oracle, containers, false)) {
@@ -1871,6 +2049,9 @@ FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
     }
 
     for (auto borrowing : {true, false}) {
+      if (!options.registers || (borrowing && !options.borrowing)) {
+        continue;
+      }
       containers.clear();
       steps = planWith(oracle, borrowing, true, true, containers);
       if (succeeded(steps) && planCleanup(*steps, oracle, containers, true)) {
@@ -1926,12 +2107,49 @@ bool validRegion(Block* block) {
 void emitSteps(OracleOp op, ArrayRef<UpdateStep> updateSteps,
                Operation* outerLoop, Location loc,
                DenseMap<Value, SmallVector<Value>>& storageMap,
-               SmallVector<Value>& loopHelpers, PatternRewriter& rewriter);
+               SmallVector<Value>& loopHelpers, const LoweringOptions& options,
+               PatternRewriter& rewriter);
+
+/// Undo the steps of `steps` that write helper or borrowed registers, last
+/// first, and free the helper registers. Inside a loop, the steps take their
+/// helpers from the helpers hoisted before `outerLoop`.
+void emitCleanup(ArrayRef<UpdateStep> steps,
+                 DenseMap<Value, SmallVector<Value>>& storageMap, Location loc,
+                 Operation* outerLoop, SmallVector<Value>& loopHelpers,
+                 const LoweringOptions& options, PatternRewriter& rewriter) {
+  for (const auto& step : llvm::reverse(steps)) {
+    if (!step.cleanup) {
+      continue;
+    }
+    for (size_t index : llvm::reverse(step.rollbacks)) {
+      emitInverseStep(steps[index], storageMap, loc, outerLoop, loopHelpers,
+                      options, rewriter);
+    }
+    emitInverseStep(step, storageMap, loc, outerLoop, loopHelpers, options,
+                    rewriter);
+    if (step.kind == UpdateStep::Kind::Create &&
+        step.overwriteValue == step.updateOp->getResult(0)) {
+      auto& qubits = storageMap.at(step.overwriteValue);
+      if (outerLoop != nullptr) {
+        llvm::append_range(loopHelpers, qubits);
+      } else {
+        for (auto qubit : qubits) {
+          qc::DeallocOp::create(rewriter, loc, qubit);
+        }
+      }
+    }
+    for (size_t index : step.rollbacks) {
+      emitUpdateStep(steps[index], storageMap, loc, outerLoop, loopHelpers,
+                     options, rewriter);
+    }
+  }
+}
 
 void emitForLoop(OracleOp op, scf::ForOp forOp, Operation* outerLoop,
                  const UpdateStep& step, Location loc,
                  DenseMap<Value, SmallVector<Value>>& storageMap,
-                 SmallVector<Value>& loopHelpers, PatternRewriter& rewriter) {
+                 SmallVector<Value>& loopHelpers,
+                 const LoweringOptions& options, PatternRewriter& rewriter) {
   for (auto [init, iterArg] :
        llvm::zip_equal(forOp.getInitArgs(), forOp.getRegionIterArgs())) {
     auto qubits = storageMap.at(init);
@@ -1952,12 +2170,20 @@ void emitForLoop(OracleOp op, scf::ForOp forOp, Operation* outerLoop,
   materializeClassical(*forOp.getBody(), storageMap, loc, rewriter);
 
   emitSteps(op, step.body, !outerLoop ? newForOp : outerLoop, loc, storageMap,
-            loopHelpers, rewriter);
+            loopHelpers, options, rewriter);
+  emitCleanup(step.body, storageMap, loc, !outerLoop ? newForOp : outerLoop,
+              loopHelpers, options, rewriter);
+  // The body may yield the iteration arguments in a permutation of their
+  // registers, so all bits are sorted together.
+  SmallVector<Value> yieldedBits;
+  SmallVector<Value> iterBits;
   for (auto [iterArg, yieldArg] :
        llvm::zip_equal(forOp.getRegionIterArgs(),
                        forOp.getBody()->getTerminator()->getOperands())) {
-    sortBits(storageMap.at(yieldArg), storageMap.at(iterArg), loc, rewriter);
+    llvm::append_range(yieldedBits, storageMap.at(yieldArg));
+    llvm::append_range(iterBits, storageMap.at(iterArg));
   }
+  sortBits(yieldedBits, iterBits, loc, rewriter);
 
   rewriter.setInsertionPointAfter(newForOp);
 
@@ -1978,19 +2204,21 @@ void emitForLoop(OracleOp op, scf::ForOp forOp, Operation* outerLoop,
 void emitSteps(OracleOp op, ArrayRef<UpdateStep> updateSteps,
                Operation* outerLoop, Location loc,
                DenseMap<Value, SmallVector<Value>>& storageMap,
-               SmallVector<Value>& loopHelpers, PatternRewriter& rewriter) {
+               SmallVector<Value>& loopHelpers, const LoweringOptions& options,
+               PatternRewriter& rewriter) {
   for (const auto& step : updateSteps) {
     if (auto forOp = dyn_cast<scf::ForOp>(step.updateOp)) {
       emitForLoop(op, forOp, outerLoop, step, loc, storageMap, loopHelpers,
-                  rewriter);
+                  options, rewriter);
       continue;
     }
-    emitUpdateStep(step, storageMap, loc, outerLoop, loopHelpers, rewriter);
+    emitUpdateStep(step, storageMap, loc, outerLoop, loopHelpers, options,
+                   rewriter);
   }
 }
 
 void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
-                   PatternRewriter& rewriter) {
+                   const LoweringOptions& options, PatternRewriter& rewriter) {
   rewriter.setInsertionPoint(op);
   auto loc = op->getLoc();
 
@@ -2015,29 +2243,15 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
   materializeClassical(op.getRegion().front(), storageMap, loc, rewriter);
 
   SmallVector<Value> helpers;
-  emitSteps(op, updateSteps, nullptr, loc, storageMap, helpers, rewriter);
-  DenseSet<Value> copied;
+  emitSteps(op, updateSteps, nullptr, loc, storageMap, helpers, options,
+            rewriter);
+  emitCleanup(updateSteps, storageMap, loc, nullptr, helpers, options,
+              rewriter);
 
-  for (const auto& step : llvm::reverse(updateSteps)) {
+  DenseSet<Value> copied;
+  for (const auto& step : updateSteps) {
     if (step.kind == UpdateStep::Kind::Copy) {
       copied.insert(step.overwriteValue);
-    }
-    if (!step.cleanup) {
-      continue;
-    }
-    for (size_t cleanup : llvm::reverse(step.rollbacks)) {
-      emitInverseStep(updateSteps[cleanup], storageMap, loc, rewriter);
-    }
-    emitInverseStep(step, storageMap, loc, rewriter);
-    if (step.kind == UpdateStep::Kind::Create &&
-        step.overwriteValue == step.updateOp->getResult(0)) {
-      for (auto qubit : storageMap.at(step.overwriteValue)) {
-        qc::DeallocOp::create(rewriter, loc, qubit);
-      }
-    }
-    for (size_t cleanup : step.rollbacks) {
-      emitUpdateStep(updateSteps[cleanup], storageMap, loc, nullptr, helpers,
-                     rewriter);
     }
   }
 
@@ -2053,7 +2267,8 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
 }
 
 struct ConvertOracleOp final : OpConversionPattern<OracleOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertOracleOp(MLIRContext* context, LoweringOptions options)
+      : OpConversionPattern(context), options_(options) {}
 
   LogicalResult
   matchAndRewrite(OracleOp op, OpAdaptor adaptor,
@@ -2072,15 +2287,18 @@ struct ConvertOracleOp final : OpConversionPattern<OracleOp> {
       return failure();
     }
 
-    auto updateStepsOrFailure = plan(op);
+    auto updateStepsOrFailure = plan(op, options_);
     if (failed(updateStepsOrFailure)) {
       return failure();
     }
-    rewriteOracle(op, *updateStepsOrFailure, rewriter);
+    rewriteOracle(op, *updateStepsOrFailure, options_, rewriter);
 
     rewriter.eraseOp(op);
     return success();
   }
+
+private:
+  LoweringOptions options_;
 };
 
 struct QOracleToQC final : impl::QOracleToQCBase<QOracleToQC> {
@@ -2098,7 +2316,12 @@ protected:
                            tensor::TensorDialect>();
 
     RewritePatternSet patterns(context);
-    patterns.add<ConvertOracleOp>(context);
+    patterns.add<ConvertOracleOp>(
+        context, LoweringOptions{.registers = registers,
+                                 .borrowing = borrowing,
+                                 .fusion = fusion,
+                                 .gadgets = gadgets,
+                                 .reuseLoopHelpers = reuseLoopHelpers});
 
     // Avoid retaining replaced operations and SSA uses until conversion ends.
     ConversionConfig config;

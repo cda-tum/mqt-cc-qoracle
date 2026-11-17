@@ -299,6 +299,7 @@ protected:
   std::unique_ptr<MLIRContext> context;
   std::unique_ptr<ScopedDiagnosticHandler> handler;
   std::string diagnostics;
+  QOracleToQCOptions passOptions;
 
   void SetUp() override {
     DialectRegistry registry;
@@ -329,7 +330,7 @@ protected:
 
   [[nodiscard]] bool runPass(ModuleOp moduleOp) const {
     PassManager manager(context.get());
-    manager.addPass(createQOracleToQC());
+    manager.addPass(createQOracleToQC(passOptions));
     return succeeded(manager.run(moduleOp));
   }
 
@@ -1249,28 +1250,48 @@ TEST_F(QOracleToQCTest, KeepsRegisterWhenTemporaryReadsItLater) {
   EXPECT_EQ(diagnostics, "");
 }
 
-// Inverting a loop is not supported, so a loop cannot borrow its initial
-// value. The rejection reports only the attempt without borrowing.
-TEST_F(QOracleToQCTest, RejectsLoopOverKeptRegister) {
-  expectRejected(R"mlir(
+constexpr StringRef loopOverKeptRegister = R"mlir(
     %a = memref.alloc() : memref<2x!qc.qubit>
+    %b = memref.alloc() : memref<2x!qc.qubit>
     %r = memref.alloc() : memref<2x!qc.qubit>
-    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va)
+    qoracle.oracle kept(%a : memref<2x!qc.qubit> as %va,
+                        %b : memref<2x!qc.qubit> as %vb)
                    consumed(%r : memref<2x!qc.qubit> as %vr) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
-      %c2 = arith.constant 2 : index
-      %out = scf.for %i = %c0 to %c2 step %c1
+      %c3 = arith.constant 3 : index
+      %k = arith.constant dense<[1, 2, 3]> : tensor<3xi2>
+      %out = scf.for %i = %c0 to %c3 step %c1
           iter_args(%acc = %va) -> (i2) {
-        %next = arith.xori %acc, %vr : i2
+        %ki = tensor.extract %k[%i] : tensor<3xi2>
+        %sum = arith.addi %acc, %ki : i2
+        %next = arith.xori %sum, %vb : i2
         scf.yield %next : i2
       }
       %result = arith.xori %vr, %out : i2
       qoracle.yield %result : i2
-    })mlir",
-                 "a loop initial value is not stored in consumed qubits");
-  EXPECT_EQ(StringRef(diagnostics).count("cannot lower qoracle"), 1U)
-      << diagnostics;
+    })mlir";
+
+// A loop may borrow a kept register: the loop is undone at the end, which
+// gives the register its value back.
+TEST_F(QOracleToQCTest, BorrowsKeptRegisterForLoop) {
+  expectLowersTo(loopOverKeptRegister,
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   uint64_t acc = in[0];
+                   for (uint64_t k : {1U, 2U, 3U}) {
+                     acc = ((acc + k) & 3U) ^ in[1];
+                   }
+                   return {in[0], in[1], in[2] ^ acc};
+                 });
+  EXPECT_EQ(diagnostics, "");
+}
+
+// Without borrowing, a loop must not overwrite a kept register.
+TEST_F(QOracleToQCTest, RejectsLoopOverKeptRegisterWithoutBorrowing) {
+  passOptions.borrowing = false;
+  expectRejected(loopOverKeptRegister,
+                 "a loop initial value is not stored in consumed or helper "
+                 "qubits");
 }
 
 // A rotation by a constant moves no data; the consumed register is sorted
@@ -1607,10 +1628,11 @@ TEST_F(QOracleToQCTest, RejectsXorWithOwnRotation) {
                  "a temporary depends on the value to be overwritten");
 }
 
-// The rotation of `d` is evaluated in the step of `nextR`, so it still reads
-// `d` after `nextD`. Without reordering, `nextD` cannot overwrite `d` in place.
-TEST_F(QOracleToQCTest, RejectsRotationOfValueOverwrittenEarlier) {
-  expectRejected(R"mlir(
+// A temporary rotation of `d` would be evaluated in the step of `nextR`, after
+// `nextD` overwrites `d`. Instead, the rotation gets a helper register before
+// `nextD`, not its shifts, and its cleanup rolls back `nextD`.
+TEST_F(QOracleToQCTest, RollsBackOverwriteOfValueReadByEarlierRotation) {
+  expectLowersTo(R"mlir(
     %a = memref.alloc() : memref<4x!qc.qubit>
     %d = memref.alloc() : memref<4x!qc.qubit>
     %r = memref.alloc() : memref<4x!qc.qubit>
@@ -1626,7 +1648,9 @@ TEST_F(QOracleToQCTest, RejectsRotationOfValueOverwrittenEarlier) {
       %nextR = arith.xori %vr, %rot : i4
       qoracle.yield %nextD, %nextR : i4, i4
     })mlir",
-                 "yielded value 0 does not match");
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ in[0], in[2] ^ rotl(in[1], 1, 4)};
+                 });
 }
 
 // A shift with a second user computes more than the rotation.
@@ -2987,11 +3011,11 @@ TEST_F(QOracleToQCTest, FallsBackToTemporariesWhenCleanupIsIllegal) {
   EXPECT_EQ(countHelpers(body), 0U);
 }
 
-// Inverting a loop is not supported, so R6 cannot clean up a helper register
-// that a loop updates. Without helper registers, `%t` has no qubits to loop
-// over.
-TEST_F(QOracleToQCTest, RejectsLoopOverHelperRegister) {
-  expectRejected(R"mlir(
+// A loop that updates a helper register is undone at the end by its inverse:
+// the iterations run backwards, so each one adds the constant of its own
+// iteration back.
+TEST_F(QOracleToQCTest, CleansUpLoopOverHelperRegister) {
+  constexpr StringRef body = R"mlir(
     %a = memref.alloc() : memref<2x!qc.qubit>
     %b = memref.alloc() : memref<2x!qc.qubit>
     %x = memref.alloc() : memref<2x!qc.qubit>
@@ -3002,18 +3026,59 @@ TEST_F(QOracleToQCTest, RejectsLoopOverHelperRegister) {
                             %y : memref<2x!qc.qubit> as %vy) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
-      %c2 = arith.constant 2 : index
+      %c3 = arith.constant 3 : index
+      %k = arith.constant dense<[1, 2, 3]> : tensor<3xi2>
       %t = arith.andi %va, %vb : i2
       %x1 = arith.xori %vx, %t : i2
-      %out = scf.for %i = %c0 to %c2 step %c1
+      %out = scf.for %i = %c0 to %c3 step %c1
           iter_args(%acc = %t) -> (i2) {
-        %next = arith.xori %acc, %va : i2
+        %ki = tensor.extract %k[%i] : tensor<3xi2>
+        %sum = arith.addi %acc, %ki : i2
+        %next = arith.xori %sum, %va : i2
         scf.yield %next : i2
       }
       %y1 = arith.xori %vy, %out : i2
       qoracle.yield %x1, %y1 : i2, i2
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    uint64_t acc = in[0] & in[1];
+    for (uint64_t k : {1U, 2U, 3U}) {
+      acc = ((acc + k) & 3U) ^ in[0];
+    }
+    return {in[0], in[1], in[2] ^ (in[0] & in[1]), in[3] ^ acc};
+  });
+  EXPECT_EQ(diagnostics, "");
+}
+
+// A loop body may yield its iteration arguments in each other's registers;
+// SWAP gates move them back at the end of each iteration.
+TEST_F(QOracleToQCTest, PermutesIterationArgumentRegisters) {
+  expectLowersTo(R"mlir(
+    %x = memref.alloc() : memref<3x!qc.qubit>
+    %y = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle consumed(%x : memref<3x!qc.qubit> as %vx,
+                            %y : memref<3x!qc.qubit> as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c3 = arith.constant 3 : index
+      %out:2 = scf.for %i = %c0 to %c3 step %c1
+          iter_args(%p = %vx, %q = %vy) -> (i3, i3) {
+        %s = arith.addi %q, %p : i3
+        scf.yield %s, %p : i3, i3
+      }
+      qoracle.yield %out#0, %out#1 : i3, i3
     })mlir",
-                 "a loop initial value is not stored in consumed qubits");
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   uint64_t p = in[0];
+                   uint64_t q = in[1];
+                   for (int i = 0; i < 3; ++i) {
+                     auto s = (p + q) & 7U;
+                     q = p;
+                     p = s;
+                   }
+                   return {p, q};
+                 });
+  EXPECT_EQ(diagnostics, "");
 }
 
 TEST_F(QOracleToQCTest, RepeatsLoopBody) {
@@ -3276,21 +3341,24 @@ TEST_F(QOracleToQCTest, RejectsInitialValueReadAfterLoop) {
                  "initial value is read after the loop");
 }
 
-TEST_F(QOracleToQCTest, RejectsLoopSwappingIterationArguments) {
-  expectRejected(R"mlir(
+// Each iteration swaps the two qubits, so three iterations swap them once.
+TEST_F(QOracleToQCTest, SwapsIterationArgumentsInLoop) {
+  expectLowersTo(
+      R"mlir(
     %x = qc.alloc : !qc.qubit
     %y = qc.alloc : !qc.qubit
     qoracle.oracle consumed(%x : !qc.qubit as %vx, %y : !qc.qubit as %vy) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
-      %c2 = arith.constant 2 : index
-      %out:2 = scf.for %i = %c0 to %c2 step %c1
+      %c3 = arith.constant 3 : index
+      %out:2 = scf.for %i = %c0 to %c3 step %c1
           iter_args(%p = %vx, %q = %vy) -> (i1, i1) {
         scf.yield %q, %p : i1, i1
       }
       qoracle.yield %out#0, %out#1 : i1, i1
     })mlir",
-                 "loop yields value 0");
+      [](ArrayRef<uint64_t> in) -> RegisterValues { return {in[1], in[0]}; });
+  EXPECT_EQ(diagnostics, "");
 }
 
 TEST_F(QOracleToQCTest, LeavesLoopsOutsideOraclesUnchanged) {
@@ -4124,5 +4192,175 @@ TEST_F(QOracleToQCTest, RollsBackOverwriteThatRollbackReads) {
                    auto c1 = in[2] ^ in[1];
                    return {in[0], in[1] ^ in[0], c1,
                            in[3] ^ (in[0] & in[2] & c1)};
+                 });
+}
+
+// A loop body may keep a value in a helper register, which it cleans up at the
+// end of each iteration. The sum is computed once into its register instead of
+// into fresh helpers for each reader.
+TEST_F(QOracleToQCTest, CreatesHelperRegisterInsideLoop) {
+  constexpr StringRef body = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %y = memref.alloc() : memref<3x!qc.qubit>
+    %z = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%y : memref<3x!qc.qubit> as %vy,
+                            %z : memref<3x!qc.qubit> as %vz) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %out:2 = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%accY = %vy, %accZ = %vz) -> (i3, i3) {
+        %sum = arith.addi %va, %vb : i3
+        %nextY = arith.xori %accY, %sum : i3
+        %nextZ = arith.xori %accZ, %sum : i3
+        scf.yield %nextY, %nextZ : i3, i3
+      }
+      qoracle.yield %out#0, %out#1 : i3, i3
+    })mlir";
+  expectLowersTo(body, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    // Two iterations XOR the same sum twice.
+    return {in[0], in[1], in[2], in[3]};
+  });
+  // The register of `%sum` and one carry of the addition.
+  EXPECT_LE(countPeakHelpers(body), 4U);
+}
+
+// The cleanup of a helper register inverts the addition of a per-iteration
+// constant, so its classically controlled gates are reversed with the others.
+TEST_F(QOracleToQCTest, CleansUpRegisterHoldingPerIterationConstant) {
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %y = memref.alloc() : memref<3x!qc.qubit>
+    %z = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va)
+                   consumed(%y : memref<3x!qc.qubit> as %vy,
+                            %z : memref<3x!qc.qubit> as %vz) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %k = arith.constant dense<[3, 5]> : tensor<2xi3>
+      %out:2 = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%accY = %vy, %accZ = %vz) -> (i3, i3) {
+        %ki = tensor.extract %k[%i] : tensor<2xi3>
+        %sum = arith.addi %va, %ki : i3
+        %nextY = arith.xori %accY, %sum : i3
+        %nextZ = arith.addi %accZ, %sum : i3
+        scf.yield %nextY, %nextZ : i3, i3
+      }
+      qoracle.yield %out#0, %out#1 : i3, i3
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   auto y = in[1];
+                   auto z = in[2];
+                   for (uint64_t k : {3U, 5U}) {
+                     auto sum = (in[0] + k) & 7U;
+                     y ^= sum;
+                     z = (z + sum) & 7U;
+                   }
+                   return {in[0], y, z};
+                 });
+}
+
+// Statement fusion discards helpers after a step allocates them. Inside a loop,
+// those helpers must not stay in the pool, so the loop needs no more helpers
+// than the same code outside a loop.
+TEST_F(QOracleToQCTest, ReusesHelpersDiscardedByFusionInsideLoop) {
+  constexpr StringRef loop = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %x = memref.alloc() : memref<3x!qc.qubit>
+    %y = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%x : memref<3x!qc.qubit> as %vx,
+                            %y : memref<3x!qc.qubit> as %vy) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %out:2 = scf.for %i = %c0 to %c2 step %c1
+          iter_args(%accX = %vx, %accY = %vy) -> (i3, i3) {
+        %nextX = arith.addi %accX, %va : i3
+        %and = arith.andi %va, %vb : i3
+        %mixed = arith.xori %and, %nextX : i3
+        %nextY = arith.xori %accY, %mixed : i3
+        scf.yield %nextX, %nextY : i3, i3
+      }
+      qoracle.yield %out#0, %out#1 : i3, i3
+    })mlir";
+  constexpr StringRef once = R"mlir(
+    %a = memref.alloc() : memref<3x!qc.qubit>
+    %b = memref.alloc() : memref<3x!qc.qubit>
+    %x = memref.alloc() : memref<3x!qc.qubit>
+    %y = memref.alloc() : memref<3x!qc.qubit>
+    qoracle.oracle kept(%a : memref<3x!qc.qubit> as %va,
+                        %b : memref<3x!qc.qubit> as %vb)
+                   consumed(%x : memref<3x!qc.qubit> as %vx,
+                            %y : memref<3x!qc.qubit> as %vy) {
+      %nextX = arith.addi %vx, %va : i3
+      %and = arith.andi %va, %vb : i3
+      %mixed = arith.xori %and, %nextX : i3
+      %nextY = arith.xori %vy, %mixed : i3
+      qoracle.yield %nextX, %nextY : i3, i3
+    })mlir";
+  expectLowersTo(loop, [](ArrayRef<uint64_t> in) -> RegisterValues {
+    auto x = in[2];
+    auto y = in[3];
+    for (int i = 0; i < 2; ++i) {
+      x = (x + in[0]) & 7U;
+      y ^= (in[0] & in[1]) ^ x;
+    }
+    return {in[0], in[1], x, y};
+  });
+  EXPECT_LE(countPeakHelpers(loop), countPeakHelpers(once));
+}
+
+// The form of T2 in SHA-256: the sum of a XOR of rotations and a majority.
+// Without helper registers, the sum is a temporary. The top bit of the
+// majority is read only by the XOR that adds it into the sum, so it is fused
+// into the helper of the sum, which the adder also writes. The majority must
+// not then be moved into the qubits of an operand, which would give up a
+// helper that the adder still writes.
+TEST_F(QOracleToQCTest, KeepsHelpersOfMajorityFusedIntoSum) {
+  passOptions.registers = false;
+  expectLowersTo(R"mlir(
+    %a = memref.alloc() : memref<4x!qc.qubit>
+    %b = memref.alloc() : memref<4x!qc.qubit>
+    %c = memref.alloc() : memref<4x!qc.qubit>
+    %y = memref.alloc() : memref<4x!qc.qubit>
+    qoracle.oracle kept(%a : memref<4x!qc.qubit> as %va,
+                        %b : memref<4x!qc.qubit> as %vb,
+                        %c : memref<4x!qc.qubit> as %vc)
+                   consumed(%y : memref<4x!qc.qubit> as %vy) {
+      %c1 = arith.constant 1 : i4
+      %c2 = arith.constant 2 : i4
+      %c3 = arith.constant 3 : i4
+      %hi1 = arith.shli %va, %c3 : i4
+      %lo1 = arith.shrui %va, %c1 : i4
+      %rot1 = arith.ori %hi1, %lo1 : i4
+      %hi2 = arith.shli %va, %c2 : i4
+      %lo2 = arith.shrui %va, %c2 : i4
+      %rot2 = arith.ori %hi2, %lo2 : i4
+      %hi3 = arith.shli %va, %c1 : i4
+      %lo3 = arith.shrui %va, %c3 : i4
+      %rot3 = arith.ori %hi3, %lo3 : i4
+      %x = arith.xori %rot1, %rot2 : i4
+      %sigma = arith.xori %x, %rot3 : i4
+      %ab = arith.andi %va, %vb : i4
+      %ac = arith.andi %va, %vc : i4
+      %bc = arith.andi %vb, %vc : i4
+      %or = arith.ori %ab, %ac : i4
+      %maj = arith.ori %or, %bc : i4
+      %sum = arith.addi %sigma, %maj : i4
+      %next = arith.addi %vy, %sum : i4
+      qoracle.yield %next : i4
+    })mlir",
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   auto a = in[0];
+                   auto sigma = rotl(a, 3, 4) ^ rotl(a, 2, 4) ^ rotl(a, 1, 4);
+                   auto maj = (a & in[1]) | (a & in[2]) | (in[1] & in[2]);
+                   return {a, in[1], in[2], (in[3] + sigma + maj) & 15U};
                  });
 }

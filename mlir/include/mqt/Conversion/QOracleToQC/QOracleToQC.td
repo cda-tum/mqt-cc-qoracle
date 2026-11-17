@@ -27,6 +27,21 @@ def QOracleToQC : Pass<"qoracle-to-qc", "mlir::ModuleOp"> {
     qubits, are reported as errors before the IR is changed.
   }];
 
+  let options =
+      [Option<"registers", "registers", "bool", /*default=*/"true",
+              "Keep values that several steps read in helper registers">,
+       Option<"borrowing", "borrowing", "bool", /*default=*/"true",
+              "Compute values in kept qubits and restore them afterwards">,
+       Option<"fusion", "fusion", "bool", /*default=*/"true",
+              "Compute a temporary that one XOR reads directly into the XOR's "
+              "target">,
+       Option<"gadgets", "gadgets", "bool", /*default=*/"true",
+              "Compute majorities in the qubits of an operand">,
+       Option<"reuseLoopHelpers", "reuse-loop-helpers", "bool",
+              /*default=*/"true",
+              "Share the helper qubits of a loop body between its steps">,
+  ];
+
   let dependentDialects = ["mlir::qc::QCDialect", "mlir::scf::SCFDialect",
                            "mlir::arith::ArithDialect",
                            "mlir::memref::MemRefDialect",
