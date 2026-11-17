@@ -75,24 +75,11 @@ SmallVector<Value> operandsToOverwrite(Operation* op, OracleOp oracle) {
   return canOverwrite;
 }
 
-bool mustWait(Operation* op, OracleOp oracle, ArrayRef<Operation*> unplaced) {
-  auto candidates = operandsToOverwrite(op, oracle);
-  if (candidates.empty()) {
-    return false;
-  }
-
-  auto* block = op->getBlock();
-  auto isReadByOther = [&](Value value) {
-    auto readByUnplaced = llvm::any_of(unplaced, [&](Operation* other) {
-      return other != op && llvm::is_contained(getNestedOperands(other), value);
-    });
-    auto readLater = llvm::any_of(value.getUsers(), [&](Operation* user) {
-      auto* ancestor = block->findAncestorOpInBlock(*user);
-      return ancestor != nullptr || ancestor == block->getTerminator();
-    });
-    return readByUnplaced || readLater;
-  };
-  return llvm::all_of(candidates, isReadByOther);
+// An operation that can overwrite an operand waits while an operation that
+// cannot is ready, so that the last reader of a value is the one to overwrite
+// it.
+bool mustWait(Operation* op, OracleOp oracle) {
+  return !operandsToOverwrite(op, oracle).empty();
 }
 
 Operation* chooseNext(ArrayRef<Operation*> unplaced, OracleOp oracle) {
@@ -104,7 +91,7 @@ Operation* chooseNext(ArrayRef<Operation*> unplaced, OracleOp oracle) {
     if (firstReady == nullptr) {
       firstReady = op;
     }
-    if (!mustWait(op, oracle, unplaced)) {
+    if (!mustWait(op, oracle)) {
       return op;
     }
   }

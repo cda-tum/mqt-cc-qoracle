@@ -1086,10 +1086,11 @@ TEST_F(QOracleToQCTest, RejectsTemporaryReadingTheOverwrittenValue) {
                  "a temporary depends on the value to be overwritten");
 }
 
-// The temporary `t` is evaluated in the step of `y1`, so it still reads `x`
-// after `x1`. Without reordering, `x1` cannot overwrite `x` in place.
-TEST_F(QOracleToQCTest, RejectsTemporaryReadingValueOverwrittenEarlier) {
-  expectRejected(R"mlir(
+// A temporary `t` would be evaluated in the step of `y1`, after `x1`
+// overwrites `x`. Instead, `t` gets a helper register before `x1`, and its
+// cleanup rolls back `x1`.
+TEST_F(QOracleToQCTest, RollsBackOverwriteOfValueReadByEarlierTemporary) {
+  expectLowersTo(R"mlir(
     %k = qc.alloc : !qc.qubit
     %x = qc.alloc : !qc.qubit
     %y = qc.alloc : !qc.qubit
@@ -1100,7 +1101,9 @@ TEST_F(QOracleToQCTest, RejectsTemporaryReadingValueOverwrittenEarlier) {
       %y1 = arith.xori %vy, %t : i1
       qoracle.yield %x1, %y1 : i1, i1
     })mlir",
-                 "yielded value 0 does not match");
+                 [](ArrayRef<uint64_t> in) -> RegisterValues {
+                   return {in[0], in[1] ^ in[0], in[2] ^ (in[1] & in[0])};
+                 });
 }
 
 TEST_F(QOracleToQCTest, LowersCapturedConstant) {

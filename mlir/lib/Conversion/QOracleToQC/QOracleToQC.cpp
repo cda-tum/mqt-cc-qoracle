@@ -68,6 +68,7 @@ struct UpdateStep {
   bool borrows = false;
   SmallVector<Operation*> temporaries;
   std::vector<UpdateStep> body;
+  std::vector<size_t> rollbacks;
   Kind kind = Kind::Update;
   bool cleanup = false;
 };
@@ -1374,7 +1375,7 @@ DenseSet<Value> readContainers(const UpdateStep& step,
 }
 
 bool planCleanup(SmallVector<UpdateStep>& steps, OracleOp oracle,
-                 DenseMap<Value, Value>& containers) {
+                 DenseMap<Value, Value>& containers, bool allowRollback) {
   for (auto& step : steps) {
     if (llvm::any_of(writtenContainers(step, containers), [&](Value write) {
           return !oracle.isConsumedAlias(write);
@@ -1385,27 +1386,55 @@ bool planCleanup(SmallVector<UpdateStep>& steps, OracleOp oracle,
       }
     }
   }
+
   for (size_t i = 0; i < steps.size(); ++i) {
+    SmallVector<size_t> toUndo;
     if (!steps[i].cleanup) {
       continue;
     }
-    for (size_t j = i + 1; j < steps.size(); ++j) {
-      if (steps[j].cleanup) {
-        continue;
-      }
-      auto writesJ = writtenContainers(steps[j], containers);
-      auto readsI = readContainers(steps[i], containers);
-      if (llvm::any_of(writesJ,
-                       [&](Value write) { return readsI.contains(write); })) {
-        return false;
+    auto needed = readContainers(steps[i], containers);
+    bool repeat = true;
+    while (repeat) {
+      repeat = false;
+      for (size_t j = i + 1; j < steps.size(); ++j) {
+        if (steps[j].cleanup || llvm::is_contained(toUndo, j)) {
+          continue;
+        }
+        auto writesJ = writtenContainers(steps[j], containers);
+        if (llvm::any_of(writesJ,
+                         [&](Value write) { return needed.contains(write); })) {
+          if (!allowRollback || isa<scf::ForOp>(steps[j].updateOp)) {
+            return false;
+          }
+          toUndo.push_back(j);
+          needed.insert_range(readContainers(steps[j], containers));
+          repeat = true;
+        }
       }
     }
+    if (llvm::any_of(toUndo, [&](size_t j) {
+          auto reads = readContainers(steps[j], containers);
+          return llvm::any_of(
+              llvm::enumerate(ArrayRef(steps).drop_front(i + 1)),
+              [&](auto pair) {
+                auto [index, step] = pair;
+                return step.cleanup &&
+                       llvm::any_of(
+                           writtenContainers(step, containers),
+                           [&](Value write) { return reads.contains(write); });
+              });
+        })) {
+      return false;
+    }
+    llvm::sort(toUndo);
+    steps[i].rollbacks = std::vector(toUndo.begin(), toUndo.end());
   }
   return true;
 }
 
 bool isReadByLaterStep(Operation* op, Value value,
-                       DenseMap<Value, Value>& containers) {
+                       DenseMap<Value, Value>& containers,
+                       SmallVector<Operation*>* promoted = nullptr) {
   for (auto* user : value.getUsers()) {
     auto* ancestor = op->getBlock()->findAncestorOpInBlock(*user);
     if (!ancestor || ancestor == op) {
@@ -1418,30 +1447,36 @@ bool isReadByLaterStep(Operation* op, Value value,
         containers.contains(ancestor->getResult(0))) {
       continue;
     }
-    if (isReadByLaterStep(op, ancestor->getResult(0), containers)) {
-      return true;
+    if (isReadByLaterStep(op, ancestor->getResult(0), containers, nullptr)) {
+      if (!promoted) {
+        return true;
+      }
+      promoted->push_back(ancestor);
+      continue;
     }
   }
   return false;
 }
 
 bool canOverwrite(Operation* op, Value value,
-                  DenseMap<Value, Value>& containers) {
+                  DenseMap<Value, Value>& containers,
+                  SmallVector<Operation*>* promoted = nullptr) {
   if (!containers.contains(value)) {
     return false;
   }
   if (value.getParentBlock() != op->getBlock() || !isLastReader(op, value) ||
-      isReadByLaterStep(op, value, containers)) {
+      isReadByLaterStep(op, value, containers, promoted)) {
     return false;
   }
   return true;
 }
 
-std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
-                                           DenseMap<Value, Value>& containers,
-                                           bool allowBorrowing) {
+std::tuple<Value, Value, SmallVector<Operation*>>
+operandToOverwrite(Operation* op, OracleOp oracleOp,
+                   DenseMap<Value, Value>& containers, bool allowBorrowing,
+                   bool allowRollback) {
   if (!isa<arith::XOrIOp, arith::AddIOp>(op)) {
-    return {nullptr, nullptr};
+    return {nullptr, nullptr, {}};
   }
 
   // An XOR temporary whose only reader is an XOR is computed directly into
@@ -1464,29 +1499,27 @@ std::pair<Value, Value> operandToOverwrite(Operation* op, OracleOp oracleOp,
       if (oracleOp.isKeptAlias(containers.lookup(value)) != kept) {
         continue;
       }
-      if (!canOverwrite(op, value, containers)) {
+      SmallVector<Operation*> promoted;
+      if (!canOverwrite(op, value, containers,
+                        allowRollback ? &promoted : nullptr)) {
         continue;
       }
       overwriteIndex = i;
-      break;
+      auto toOverwrite = op->getOperand(overwriteIndex);
+      auto other = op->getOperand(1 ^ overwriteIndex);
+      if (toOverwrite == other) {
+        return {nullptr, nullptr, {}};
+      }
+      return {toOverwrite, other, promoted};
     }
   }
-  if (overwriteIndex > 1) {
-    return {nullptr, nullptr};
-  }
-
-  auto toOverwrite = op->getOperand(overwriteIndex);
-  auto other = op->getOperand(1 ^ overwriteIndex);
-  if (toOverwrite == other) {
-    return {nullptr, nullptr};
-  }
-  return {toOverwrite, other};
+  return {nullptr, nullptr, {}};
 }
 
 FailureOr<SmallVector<UpdateStep>>
 planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
           const DenseMap<Operation*, Value>& creations, bool allowBorrowing,
-          bool allowRegisters);
+          bool allowRegisters, bool allowRollback);
 
 FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
                                DenseMap<Value, Value>& containers,
@@ -1536,7 +1569,7 @@ FailureOr<UpdateStep> planLoop(scf::ForOp forOp, OracleOp oracle,
   }
 
   auto body = planBlock(forOp.getBodyRegion().front(), oracle, containers,
-                        creations, false, false);
+                        creations, false, false, false);
   if (failed(body)) {
     return failure();
   }
@@ -1593,7 +1626,7 @@ UpdateStep buildCreationStep(Operation* op, Value value,
 FailureOr<SmallVector<UpdateStep>>
 planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
           const DenseMap<Operation*, Value>& creations, bool allowBorrowing,
-          bool allowRegisters) {
+          bool allowRegisters, bool allowRollback) {
   SmallVector<UpdateStep> updateSteps;
   for (auto& op : block.without_terminator()) {
     if (isClassical(&op) && !matchPattern(op.getResult(0), m_Constant())) {
@@ -1630,8 +1663,18 @@ planBlock(Block& block, OracleOp oracle, DenseMap<Value, Value>& containers,
       continue;
     }
 
-    auto [overwriteValue, other] =
-        operandToOverwrite(&op, oracle, containers, allowBorrowing);
+    auto [overwriteValue, other, promoted] = operandToOverwrite(
+        &op, oracle, containers, allowBorrowing, allowRollback);
+    for (auto* promotedOp : promoted) {
+      auto* insertionPoint =
+          llvm::find_if(updateSteps, [&](const UpdateStep& step) {
+            return promotedOp->isBeforeInBlock(step.updateOp);
+          });
+      updateSteps.insert(
+          insertionPoint,
+          buildCreationStep(promotedOp, promotedOp->getResult(0), containers));
+      containers[promotedOp->getResult(0)] = promotedOp->getResult(0);
+    }
     auto temporaries = isFolded(&op, other)
                            ? SmallVector<Operation*>{}
                            : reachableTemporaries(other, containers);
@@ -1747,7 +1790,7 @@ FailureOr<DenseMap<Operation*, Value>> findCreations(OracleOp oracle) {
 
 FailureOr<SmallVector<UpdateStep>>
 planWith(OracleOp oracle, bool allowBorrowing, bool allowRegisters,
-         DenseMap<Value, Value>& containers) {
+         bool allowRollback, DenseMap<Value, Value>& containers) {
   for (auto consumed : oracle.getConsumedAliases()) {
     containers[consumed] = consumed;
   }
@@ -1769,8 +1812,9 @@ planWith(OracleOp oracle, bool allowBorrowing, bool allowRegisters,
   if (failed(creations)) {
     return failure();
   }
-  auto steps = planBlock(oracle.getRegion().front(), oracle, containers,
-                         *creations, allowBorrowing, allowRegisters);
+  auto steps =
+      planBlock(oracle.getRegion().front(), oracle, containers, *creations,
+                allowBorrowing, allowRegisters, allowRollback);
   if (failed(steps)) {
     return failure();
   }
@@ -1806,25 +1850,38 @@ planWith(OracleOp oracle, bool allowBorrowing, bool allowRegisters,
 }
 
 FailureOr<SmallVector<UpdateStep>> plan(OracleOp oracle) {
+  DenseMap<Value, Value> containers;
   {
+    ScopedDiagnosticHandler silence(oracle.getContext(),
+                                    [](Diagnostic&) { return success(); });
     for (auto [registers, borrowing] : SmallVector<std::pair<bool, bool>>{
              {true, true}, {true, false}, {false, true}}) {
-      ScopedDiagnosticHandler silence(oracle.getContext(),
-                                      [](Diagnostic&) { return success(); });
-      DenseMap<Value, Value> containers;
-      auto steps = planWith(oracle, borrowing, registers, containers);
-      if (succeeded(steps) && planCleanup(*steps, oracle, containers)) {
+      containers.clear();
+      auto steps = planWith(oracle, borrowing, registers, false, containers);
+      if (succeeded(steps) && planCleanup(*steps, oracle, containers, false)) {
+        return steps;
+      }
+    }
+
+    containers.clear();
+    auto steps = planWith(oracle, false, false, false, containers);
+    if (succeeded(steps) && planCleanup(*steps, oracle, containers, false)) {
+
+      return steps;
+    }
+
+    for (auto borrowing : {true, false}) {
+      containers.clear();
+      steps = planWith(oracle, borrowing, true, true, containers);
+      if (succeeded(steps) && planCleanup(*steps, oracle, containers, true)) {
         return steps;
       }
     }
   }
-  DenseMap<Value, Value> containers;
-  auto steps = planWith(oracle, false, false, containers);
-  if (failed(steps)) {
-    return failure();
-  }
-  planCleanup(*steps, oracle, containers);
-  return steps;
+
+  // return `failure` but also print the error message to the user
+  containers.clear();
+  return planWith(oracle, false, false, false, containers);
 }
 
 bool validRegion(Block* block) {
@@ -1968,12 +2025,19 @@ void rewriteOracle(OracleOp op, ArrayRef<UpdateStep> updateSteps,
     if (!step.cleanup) {
       continue;
     }
+    for (size_t cleanup : llvm::reverse(step.rollbacks)) {
+      emitInverseStep(updateSteps[cleanup], storageMap, loc, rewriter);
+    }
     emitInverseStep(step, storageMap, loc, rewriter);
     if (step.kind == UpdateStep::Kind::Create &&
         step.overwriteValue == step.updateOp->getResult(0)) {
       for (auto qubit : storageMap.at(step.overwriteValue)) {
         qc::DeallocOp::create(rewriter, loc, qubit);
       }
+    }
+    for (size_t cleanup : step.rollbacks) {
+      emitUpdateStep(updateSteps[cleanup], storageMap, loc, nullptr, helpers,
+                     rewriter);
     }
   }
 
