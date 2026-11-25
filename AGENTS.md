@@ -21,19 +21,21 @@ repository, not to core's glossary.
   `git -C external/mqt-core status` before you finish.
 - Keep the patch limited to registering QOracle in core targets. Put new code,
   tests, and build logic in this repository. After you change the patch, check
-  that `scripts/apply-patches.sh` applies it to a clean submodule.
+  that configuring applies it to a clean submodule.
 - When you move the submodule to a newer commit, update the patch and fix the
   QOracle code in the same commit as the new pin.
 - Give QOracle tests the `qoracle` label.
+- CI builds all of MQT Core and runs all its tests with the patch applied. A
+  failing core test there means the patch or the pin broke core.
 
 ## Build and validation
 
 | Task                         | Command                                                                                                                  |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Apply the patch              | `scripts/apply-patches.sh`                                                                                               |
 | Configure                    | `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMLIR_DIR=<llvm-prefix>/lib/cmake/mlir -DLLVM_DIR=<llvm-prefix>/lib/cmake/llvm` |
 | Build                        | `cmake --build build`                                                                                                    |
 | QOracle tests                | `ctest --test-dir build -L qoracle`                                                                                      |
+| All tests, as in CI           | `cmake --preset release && cmake --build --preset release && ctest --preset release`                                    |
 | QOracle passes in the driver | `build/bin/mqt-core compile --run-pipeline --pass-pipeline='builtin.module(qoracle-to-qc)' <input.mlir>`                 |
 
 Use `uvx cmake` if the system CMake is older than 3.29. With GCC 13, add

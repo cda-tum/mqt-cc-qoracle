@@ -14,31 +14,39 @@ project(
   DESCRIPTION "QOracle dialect and lowering for the MQT Core compiler")
 
 option(BUILD_MQT_CORE_QORACLE_TESTS "Build the QOracle unit tests" ${PROJECT_IS_TOP_LEVEL})
+option(BUILD_ALL_MQT_CORE_TARGETS "Build all MQT Core targets, including enabled core tests" OFF)
 
 set(MQT_CORE_SOURCE_DIR "${PROJECT_SOURCE_DIR}/external/mqt-core")
 set(MQT_CORE_BINARY_DIR "${PROJECT_BINARY_DIR}/external/mqt-core")
 
 if(NOT EXISTS "${MQT_CORE_SOURCE_DIR}/CMakeLists.txt")
-  message(FATAL_ERROR "external/mqt-core is empty. Run scripts/apply-patches.sh.")
+  message(FATAL_ERROR "external/mqt-core is empty. Run git submodule update --init.")
 endif()
 
-# The patches register QOracle in the compiler. Without them, core would build a compiler that
-# silently lacks QOracle, so stop at configure time instead.
+# The patches register QOracle in the compiler. Apply them here so that every build, CI included,
+# uses the patched core. Patches that are already applied are skipped.
 find_package(Git REQUIRED)
 file(
   GLOB MQT_CORE_QORACLE_PATCHES
   CONFIGURE_DEPENDS
   "${PROJECT_SOURCE_DIR}/patches/*.patch")
 foreach(patch IN LISTS MQT_CORE_QORACLE_PATCHES)
+  cmake_path(GET patch FILENAME patch_name)
   execute_process(
     COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${patch}"
     WORKING_DIRECTORY "${MQT_CORE_SOURCE_DIR}"
     RESULT_VARIABLE patch_missing
     OUTPUT_QUIET ERROR_QUIET)
   if(patch_missing)
-    cmake_path(GET patch FILENAME patch_name)
-    message(FATAL_ERROR "${patch_name} is not applied to external/mqt-core. "
-                        "Run scripts/apply-patches.sh.")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" apply "${patch}"
+      WORKING_DIRECTORY "${MQT_CORE_SOURCE_DIR}"
+      RESULT_VARIABLE patch_failed
+      ERROR_VARIABLE patch_error)
+    if(patch_failed)
+      message(FATAL_ERROR "${patch_name} does not apply to external/mqt-core:\n${patch_error}")
+    endif()
+    message(STATUS "Applied ${patch_name} to external/mqt-core")
   endif()
 endforeach()
 
@@ -55,8 +63,12 @@ if(BUILD_MQT_CORE_QORACLE_TESTS)
   include(GoogleTest)
 endif()
 
-# Only targets that the default target needs are built from mqt-core.
-add_subdirectory("${MQT_CORE_SOURCE_DIR}" "${MQT_CORE_BINARY_DIR}" EXCLUDE_FROM_ALL)
+if(BUILD_ALL_MQT_CORE_TARGETS)
+  add_subdirectory("${MQT_CORE_SOURCE_DIR}" "${MQT_CORE_BINARY_DIR}")
+else()
+  # Only targets that the default target needs are built from mqt-core.
+  add_subdirectory("${MQT_CORE_SOURCE_DIR}" "${MQT_CORE_BINARY_DIR}" EXCLUDE_FROM_ALL)
+endif()
 
 # Match the MLIR setup that mqt-core applies to its own directory scope.
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}" "${LLVM_CMAKE_DIR}")

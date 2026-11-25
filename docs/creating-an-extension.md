@@ -80,7 +80,7 @@ git -C external/mqt-core diff > patches/0001-register-<name>-in-compiler.patch
 ```
 
 Put a short description above the first `diff --git` line. `git apply` skips
-that text. Copy `scripts/apply-patches.sh` from this repository unchanged.
+that text.
 
 Core targets in the patch can name extension targets, such as
 `MLIRQOracleDialect`, before the extension defines them. CMake resolves the
@@ -94,8 +94,11 @@ Copy `CMakeLists.txt` and `mlir/CMakeLists.txt` from this repository and change
 the names and folders. The root file does these things, in order:
 
 1. Sets `cmake_minimum_required` to the range that core uses.
-2. Stops configuration if a patch is not applied. Otherwise core builds a
-   compiler that silently lacks the extension.
+2. Applies the patches to `external/mqt-core` and skips those that are
+   already applied. Configuration fails if a patch does not apply, so core
+   cannot build a compiler that silently lacks the extension. Applying the
+   patches here, instead of in a separate script, lets CI use MQT's reusable
+   workflow, which runs only CMake.
 3. Finds LLVM/MLIR before it adds core. Core's `cmake/SetupMLIR.cmake` then
    reuses that SDK. Because of this, the extension does not download the SDK
    and needs `MLIR_DIR`.
@@ -103,7 +106,8 @@ the names and folders. The root file does these things, in order:
    extension's tests are enabled. The tests then reuse core's GoogleTest setup
    and `mqt_mlir_configure_unittest_target`.
 5. Adds core with `EXCLUDE_FROM_ALL`, so the default target builds only the
-   `mqt-core` executable and the extension.
+   `mqt-core` executable and the extension. The `BUILD_ALL_MQT_CORE_TARGETS`
+   option adds core without it, so that CI builds and runs all core tests.
 6. Repeats the MLIR setup that core applies to its own folder: the
    `TableGen`, `AddLLVM`, `AddMLIR`, and `HandleLLVMOptions` modules, include
    folders for core's and the extension's source and generated headers,
@@ -116,24 +120,39 @@ folders, because `mqt_mlir_configure_unittest_target` reads it from the
 calling folder. Give the extension's tests their own `LABELS` value, so that
 `ctest -L <label>` runs them without core's tests.
 
-### 6. Add the remaining files
+### 6. Add CI
+
+Copy `CMakePresets.json` and `.github/workflows/ci.yml` from this repository
+unchanged. The workflow calls MQT's reusable Ubuntu workflow, the one MQT
+Core's CI uses, with the same runners and build types. The presets set
+`BUILD_ALL_MQT_CORE_TARGETS`, so each CI job builds all of MQT Core with the
+patches applied and runs all core and extension tests. A failing core test
+means that the patch or the pinned commit broke core.
+
+The workflow installs LLVM/MLIR with `setup-mlir`, which sets `MLIR_DIR` and
+`LLVM_DIR`. Keep its `llvm-version` equal to `MQT_CORE_MLIR_VERSION` in
+`external/mqt-core/cmake/SetupMLIR.cmake`, and update both workflow
+references when MQT Core updates its own.
+
+### 7. Add the remaining files
 
 - `README.md` with the build and update steps.
 - `docs/glossary.md` with the glossary entries that the branch added to core.
 - `LICENSE`. The moved sources carry MIT headers.
 - `AGENTS.md` that defers to core's guide and adds the extension rules.
 
-### 7. Verify
+### 8. Verify
 
-Configure and build from a clean folder, then check four things:
+Configure and build from a clean folder, then check these things:
 
 1. The extension's tests pass: `ctest --test-dir build -L <label>`.
 2. The compiler accepts the extension. `mqt-core compile --help` does not list
    passes, so run them:
    `mqt-core compile --run-pipeline --pass-pipeline='builtin.module(<passes>)' <input.mlir>`.
-3. Configuration fails after you reverse the patch with
-   `git -C external/mqt-core apply --reverse <patch>`.
-4. `scripts/apply-patches.sh` applies the patch and skips it on a second run.
+3. Configuration applies the patch to a clean submodule and skips it when you
+   configure again.
+4. CI passes on the first push. It is the only check that builds and runs all
+   core tests with the patch applied, unless you run the presets locally.
 
 ## Known problems
 

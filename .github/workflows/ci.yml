@@ -1,0 +1,45 @@
+# Copyright (c) 2023 - 2026 Chair for Design Automation, TUM
+# Copyright (c) 2025 - 2026 Munich Quantum Software Company GmbH
+# All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+#
+# Licensed under the MIT License
+
+# Builds the pinned MQT Core with the patches applied, then runs all MQT Core tests and all extension
+# tests. The configure step applies the patches; see CMakeLists.txt.
+name: CI
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Same runners, compiler, and build types as the Ubuntu jobs of MQT Core's CI.
+  cpp-tests-ubuntu:
+    name: 🇨 Test 🐧
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-26.04
+            preset: debug
+          - runs-on: ubuntu-26.04-arm
+            preset: release
+    uses: munich-quantum-toolkit/workflows/.github/workflows/reusable-cpp-tests-ubuntu.yml@4e380c0bb1774aa8b9dd53194f4a7f6575cc3d42 # v2.5.10
+    with:
+      runs-on: ${{ matrix.runs-on }}
+      compiler: gcc
+      preset-name: ${{ matrix.preset }}
+      setup-mlir: true
+      # Keep equal to MQT_CORE_MLIR_VERSION in external/mqt-core/cmake/SetupMLIR.cmake.
+      llvm-version: "23.1.2"
