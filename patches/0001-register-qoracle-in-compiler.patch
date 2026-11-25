@@ -1,0 +1,108 @@
+Register QOracle in the MQT Core compiler
+
+Adds the QOracle dialect to the compiler context, registers the QOracle passes
+and the QOracle-to-QC conversion in `mqt-core compile`, and links the QOracle
+libraries into the core targets that need them. The linked targets are defined
+by the mqt-core-qoracle project, so this patch only builds inside it.
+
+diff --git a/mlir/lib/Compiler/CMakeLists.txt b/mlir/lib/Compiler/CMakeLists.txt
+index 4604f28e6..e51651283 100644
+--- a/mlir/lib/Compiler/CMakeLists.txt
++++ b/mlir/lib/Compiler/CMakeLists.txt
+@@ -92,6 +92,7 @@ add_mlir_library(
+   MQT::MLIRSupport
+   MLIRQCODialect
+   MLIRQCOUtils
++  MLIRQOracleDialect
+   MLIRQTensorDialect
+   MLIRSCFDialect
+   MLIRSupport
+diff --git a/mlir/lib/Compiler/Programs.cpp b/mlir/lib/Compiler/Programs.cpp
+index 85b4f72f1..54d15c6c0 100644
+--- a/mlir/lib/Compiler/Programs.cpp
++++ b/mlir/lib/Compiler/Programs.cpp
+@@ -18,6 +18,7 @@
+ #include "mqt/Dialect/QC/IR/QCOps.h"
+ #include "mqt/Dialect/QCO/IR/QCODialect.h"
+ #include "mqt/Dialect/QCO/Utils/LinearityUtils.h"
++#include "mqt/Dialect/QOracle/IR/QOracleDialect.h"
+ #include "mqt/Dialect/QTensor/IR/QTensorDialect.h"
+ #include "mqt/Support/Passes.h"
+ #include "mqt/Target/OpenQASM/TranslateOpenQASMToQC.h"
+@@ -81,7 +82,8 @@ static void ensureInlinerExtensions(MLIRContext* context) {
+ std::shared_ptr<MLIRContext> createCompilerContext() {
+   DialectRegistry registry;
+   registry.insert<cbit::CBitDialect, mqt::MQTDialect, qc::QCDialect,
+-                  qco::QCODialect, qtensor::QTensorDialect, arith::ArithDialect,
++                  qco::QCODialect, qoracle::QOracleDialect,
++                  qtensor::QTensorDialect, arith::ArithDialect,
+                   cf::ControlFlowDialect, func::FuncDialect, math::MathDialect,
+                   scf::SCFDialect, LLVM::LLVMDialect, memref::MemRefDialect,
+                   tensor::TensorDialect, jeff::JeffDialect,
+diff --git a/mlir/lib/Support/CMakeLists.txt b/mlir/lib/Support/CMakeLists.txt
+index 426fb8616..a31a2bdbb 100644
+--- a/mlir/lib/Support/CMakeLists.txt
++++ b/mlir/lib/Support/CMakeLists.txt
+@@ -32,7 +32,8 @@ add_mlir_library(
+   MLIRQCTransforms
+   MLIRQCOTransforms
+   MLIRQIRTransforms
+-  MLIRQTensorTransforms)
++  MLIRQTensorTransforms
++  MLIRQOracleTransforms)
+ 
+ mqt_mlir_target_use_project_options(MLIRSupportMQT)
+ 
+diff --git a/mlir/lib/Support/Passes.cpp b/mlir/lib/Support/Passes.cpp
+index 534e28933..a73fb800c 100644
+--- a/mlir/lib/Support/Passes.cpp
++++ b/mlir/lib/Support/Passes.cpp
+@@ -17,6 +17,7 @@
+ #include "mqt/Dialect/QC/Transforms/Passes.h"
+ #include "mqt/Dialect/QCO/Transforms/Passes.h"
+ #include "mqt/Dialect/QIR/Transforms/Passes.h"
++#include "mqt/Dialect/QOracle/Transforms/Passes.h"
+ #include "mqt/Dialect/QTensor/Transforms/Passes.h"
+ #include "mqt/Support/RandomSeed.h"
+ 
+@@ -104,6 +105,8 @@ void registerMQTCompilerPasses() {
+     mqt::registerUnrollModifiers();
+     qc::registerShrinkQubitRegistersPass();
+     qtensor::registerShrinkQTensorToFitPass();
++    qoracle::registerReassociateOracle();
++    qoracle::registerScheduleOracle();
+     qir::registerQIRPasses();
+     PassPipelineRegistration<>("mqt-qco-default",
+                                "Run the default MQT QCO optimization pipeline.",
+diff --git a/mlir/tools/CMakeLists.txt b/mlir/tools/CMakeLists.txt
+index f97bd1294..8a57d41a2 100644
+--- a/mlir/tools/CMakeLists.txt
++++ b/mlir/tools/CMakeLists.txt
+@@ -24,6 +24,7 @@ target_link_libraries(
+     MLIRJeffToQCO
+     MLIRBytecodeWriter
+     MLIRQIRTranslation
++    MLIRQOracleToQC
+     MQTCompilerPrograms)
+ 
+ add_executable(
+diff --git a/mlir/tools/compile/Compile.cpp b/mlir/tools/compile/Compile.cpp
+index ec53764ad..eb3a4365b 100644
+--- a/mlir/tools/compile/Compile.cpp
++++ b/mlir/tools/compile/Compile.cpp
+@@ -18,6 +18,7 @@
+ #include "mqt/Conversion/QCOToQC/QCOToQC.h"
+ #include "mqt/Conversion/QCToQCO/QCToQCO.h"
+ #include "mqt/Conversion/QCToQIR/QCToQIR.h"
++#include "mqt/Conversion/QOracleToQC/QOracleToQC.h"
+ #include "mqt/Dialect/MQT/IR/MQTAttributes.h"
+ #include "mqt/Dialect/QCO/Utils/LinearityUtils.h"
+ #include "mqt/Support/Passes.h"
+@@ -358,6 +359,7 @@ int mqtCoreRunCompiler(int argc, char** argv, MQTQPYWriter qpyWriter) {
+   registerJeffToQCO();
+   registerQCOToJeff();
+   registerQCToQIR();
++  registerQOracleToQC();
+   registerAsmPrinterCLOptions();
+   registerMLIRContextCLOptions();
+   registerPassManagerCLOptions();

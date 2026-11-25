@@ -1,0 +1,4 @@
+[submodule "mqt-core"]
+	path = external/mqt-core
+	url = https://github.com/munich-quantum-toolkit/core.git
+	ignore = dirty

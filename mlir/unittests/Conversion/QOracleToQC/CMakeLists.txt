@@ -26,5 +26,5 @@ target_link_libraries(
           MLIRTensorDialect)
 mqt_mlir_configure_unittest_target(${qoracle_to_qc_target})
 
-gtest_discover_tests(${qoracle_to_qc_target} PROPERTIES LABELS mqt-mlir-unittests DISCOVERY_TIMEOUT
+gtest_discover_tests(${qoracle_to_qc_target} PROPERTIES LABELS qoracle DISCOVERY_TIMEOUT
                                                         60)

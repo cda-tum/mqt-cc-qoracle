@@ -22,4 +22,4 @@ target_link_libraries(
           MLIRSupport)
 mqt_mlir_configure_unittest_target(${qoracle_ir_target})
 
-gtest_discover_tests(${qoracle_ir_target} PROPERTIES LABELS mqt-mlir-unittests DISCOVERY_TIMEOUT 60)
+gtest_discover_tests(${qoracle_ir_target} PROPERTIES LABELS qoracle DISCOVERY_TIMEOUT 60)
