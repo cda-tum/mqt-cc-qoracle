@@ -13,6 +13,9 @@ submodule and carries a small patch that registers QOracle in the compiler.
 - `mlir/`: QOracle sources and unit tests, in the same layout as MQT Core's
   `mlir/` tree.
 - `docs/glossary.md`: terms that QOracle adds to the MQT Core glossary.
+- `docs/creating-an-extension.md`: how this repository was set up, as a recipe
+  for other MQT Core extensions.
+- `AGENTS.md`: rules for coding agents in this repository.
 
 ## Build
 
